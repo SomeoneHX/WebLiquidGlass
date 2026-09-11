@@ -1,0 +1,16 @@
+/** Port of `CatalogDestination`. */
+export type CatalogDestination =
+  | 'Home'
+  | 'Buttons'
+  | 'Toggle'
+  | 'Slider'
+  | 'BottomTabs'
+  | 'Dialog'
+  | 'LockScreen'
+  | 'ControlCenter'
+  | 'Magnifier'
+  | 'GlassPlayground'
+  | 'AdaptiveLuminanceGlass'
+  | 'ProgressiveBlur'
+  | 'ScrollContainer'
+  | 'LazyScrollContainer'

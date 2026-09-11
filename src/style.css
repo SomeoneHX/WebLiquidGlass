@@ -1,0 +1,117 @@
+:root {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --app-bg: #ffffff;
+  --app-fg: #000000;
+  --accent: #0088ff;
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  color-scheme: light;
+}
+
+/* Mirrors the Compose `isSystemInDarkTheme()` switch; toggled on <html> by App.vue. */
+:root.dark {
+  --app-bg: #121212;
+  --app-fg: #ffffff;
+  --accent: #0091ff;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+  background: var(--app-bg);
+  color: var(--app-fg);
+}
+
+#app {
+  width: 100%;
+  height: 100%;
+}
+
+/*
+ * Full-bleed, exactly like the Android app: the catalog fills the whole window. The
+ * original has no phone bezel, letterboxing or frame of any kind, so neither does this.
+ */
+.app-root {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: var(--app-bg);
+  color: var(--app-fg);
+  overflow: hidden;
+}
+
+/* --- shared glass layout ------------------------------------------------------------- */
+
+.glass-surface__content {
+  align-items: center;
+}
+
+.liquid-button__content {
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 16px;
+  width: 100%;
+  height: 100%;
+  white-space: nowrap;
+  font-size: 15px;
+}
+
+.liquid-bottom-tabs__row {
+  align-items: center;
+  padding: 4px;
+  width: 100%;
+  height: 100%;
+}
+
+/* --- utilities ----------------------------------------------------------------------- */
+
+.fill-screen {
+  width: 100%;
+  height: 100%;
+}
+
+.system-bars-padding {
+  padding-top: var(--safe-top);
+  padding-bottom: var(--safe-bottom);
+}
+
+.display-cutout-padding {
+  padding-left: var(--safe-left);
+  padding-right: var(--safe-right);
+}
+
+.nav-bars-padding {
+  padding-bottom: var(--safe-bottom);
+}
+
+.scroll-y {
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+
+.scroll-y::-webkit-scrollbar {
+  display: none;
+}
+
+.no-select {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
