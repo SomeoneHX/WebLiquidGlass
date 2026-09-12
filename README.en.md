@@ -2,7 +2,7 @@
 
 > A faithful Web port of the Android `Kyant0/AndroidLiquidGlass` (Liquid Glass / Backdrop) **Web Liquid Glass** demo.
 
-中文文档见 [`README.md`](./README.md)。
+中文文档见 [`README.md`](./README.md)（用户脚本部分同样有完整中文版，见 [中文 §10](./README.md#10-用户脚本liquid-glass-refraction)）。
 
 ---
 
@@ -114,6 +114,11 @@ WebLiquidGlass/
 ├── vite.config.ts            # base:'./', alias '@'→'./src', dev bound to 127.0.0.1:5173
 ├── tsconfig.json
 ├── public/                   # wallpapers & static assets (loaded by useWallpaper)
+├── userscript/
+│   └── liquid-glass-refract.user.js   # ★ standalone userscript extracted from core/glass-filter.ts (see §10)
+├── scripts/
+│   └── stamp-userscript.mjs  # stamps the CI run number into the script's @version on release (see §10.6)
+├── .github/workflows/deploy.yml       # Pages deploy: builds the demo + publishes the userscript
 └── src/
     ├── main.ts               # createApp(App).mount('#app')
     ├── App.vue               # shell: destination state machine + theme + Back button + layout epoch
@@ -179,6 +184,10 @@ npm run build
 
 # preview the build (http://127.0.0.1:4173)
 npm run preview
+
+# userscript: syntax check / stage it into dist/ the way CI does (see §10.6)
+npm run check:userscript
+npm run stage:userscript
 ```
 
 `density = 1`, so Kotlin `xx.dp` constants map 1:1 to CSS `px` with no conversion.
@@ -229,8 +238,139 @@ Refraction (`url()` inside `backdrop-filter`) is a **Chromium extension**. There
 
 - Refraction is unavailable on non-Chromium browsers (degrades to plain blur).
 - High-frequency filter maps are capped by a 32-entry LRU cache (`mapCache`).
+- If a site's CSP restricts `img-src` (no `data:`), the `<feImage>` displacement maps are refused and it fails **completely silently** — see [§10](#10-userscript-liquid-glass-refraction).
 - Headless environments (`--dump-dom`) starve `rAF`, so spring animations emit only a few frames — verify "is the animation running" by checking whether the inline transform changes over time, not by screenshots.
 - Future: move `glass-filter` map generation into a Worker; add a WebGL refraction fallback for non-Chromium (if WebGL is permitted at that point).
+
+---
+
+## 10. Userscript (Liquid Glass Refraction)
+
+`src/core/glass-filter.ts` is a **zero-dependency** module (the file contains not a single `import`), so it has been extracted into a directly installable userscript that turns **any element on any website** into a liquid-glass refracting lens.
+
+### 10.1 Absolute URLs
+
+It ships through this project's existing GitHub Pages workflow, so the script and the demo share one origin and one version — pushing to `main` syncs both:
+
+| Purpose | Absolute URL |
+| --- | --- |
+| Script file (install / `@require` / `@updateURL`) | `https://someonehx.github.io/WebLiquidGlass/liquid-glass-refract.user.js` |
+| Demo site (deploy root) | `https://someonehx.github.io/WebLiquidGlass/` |
+| Source (in-repo, published with Pages) | `https://github.com/SomeoneHX/WebLiquidGlass/blob/main/userscript/liquid-glass-refract.user.js` |
+
+> On the Pages side, `@version` is stamped by CI from the workflow run number (`0.2.<run_number>`), so every push produces a new version and installed copies update on the manager's next check. The in-repo file keeps a hand-written base version; `scripts/stamp-userscript.mjs` is the only place the two are allowed to diverge.
+
+### 10.2 Three ways to include it
+
+```js
+// (1) Direct install (Tampermonkey / Violentmonkey): just open the script URL; @updateURL receives updates.
+
+// (2) @require it from your own userscript:
+// @require      https://someonehx.github.io/WebLiquidGlass/liquid-glass-refract.user.js
+// @grant        none
+// The API lands on window.LiquidGlassRefract (read it via unsafeWindow in sandboxed mode):
+const { apply, unglassify } = window.LiquidGlassRefract
+apply(document.querySelector('.header'), { blur: 12, refractionAmount: 30 })
+
+// (3) Plain web page, straight <script src>:
+// <script src="https://someonehx.github.io/WebLiquidGlass/liquid-glass-refract.user.js"></script>
+```
+
+The script **does nothing by default** (with no config it scans nothing and touches no element), so `@require`-ing it is safe; a second inclusion is ignored by its own load guard and will not double-bind listeners.
+
+### 10.3 Configuration: assign `window.LiquidGlassRefractConfig` before the script runs
+
+```js
+window.LiquidGlassRefractConfig = {
+  selectors: ['.header', 'nav'],     // selectors to auto-apply; empty = do nothing
+  autoWatch: true,                   // follow SPA-inserted nodes with a MutationObserver (rAF-coalesced)
+  hotkeys: { glassify: 'alt+shift+g', unglassify: 'alt+shift+u' },  // or false to disable
+  defaults: { blur: 12, refractionHeight: 24 }   // merged into the default options
+}
+```
+
+Hotkeys act on **the element currently under the cursor** (`document.elementFromPoint`, independent of focus); the combo string supports `alt` / `shift` / `ctrl` / `meta`.
+
+### 10.4 API
+
+| Method | Description |
+| --- | --- |
+| `apply(el, options?)` | Turn the element into a glass lens. Same function as `glassify`; `apply` is the public name |
+| `glassify(el, options?)` | Same as above. Calling it again on the **same element** = update options (idempotent) |
+| `unglassify(el)` | Undo: restore the previous inline styles, remove the `<filter>`, unregister the `ResizeObserver` |
+| `applyAll()` | Sweep `selectors` immediately; returns the elements newly applied this pass |
+| `isRefractionSupported()` | Engine probe (Chromium only) |
+| `createGlassFilter()` | Low level: the SVG filter graph alone (`{ id, update(spec, amount, zoom?, overlay?), dispose() }`), you write the host |
+| `activeCount()` | Number of live glass surfaces |
+| `DEFAULTS` / `FILTER_PAD` / `config` / `version` | Default options, filter pad outset (64px), effective config, version |
+
+Options accepted by `apply`:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `blur` / `saturate` / `brightness` | `8` / `1.6` / `1.06` | Live in the same `backdrop-filter` as the refraction; they must come first, since a bare `url()` is silently ignored by Chromium |
+| `refractionHeight` | `18` | How far in from the rim the bend reaches (px) |
+| `refractionAmount` | `22` | Largest displacement at the rim (px); feeds `feDisplacementMap@scale` directly |
+| `depthEffect` | `true` | Blend the centripetal direction into the bend gradient |
+| `chromaticAberration` | `false` | Three-branch dispersion: 3 displacement maps + an 11-primitive filter graph |
+| `maxArea` | `490000` | Area ceiling; above it the element is skipped with a warning (the SDF is per-pixel, per-branch, and janks the main thread on large elements) |
+
+### 10.5 Before you use it
+
+- **You must supply the tint yourself**: the script does not touch the element's own styles, so the element needs a translucent background (e.g. `background: rgba(255,255,255,.16)`) — otherwise you get the lens without the frosted colour;
+- **Shape is `border-radius`**: the corner radius is read from computed style, so for a capsule write `border-radius: 50%` or a large radius; the displacement map is generated from the same geometry;
+- **Chromium only**: Safari / Firefox drop the whole declaration containing `url()`; the script writes plain blur for those engines;
+- **CSP is a hard gate**: if the page restricts `img-src` and disallows `data:`, the displacement maps are refused without an error (one `securitypolicyviolation` per `<feImage>`, but nothing in the console); the script detects this with a 1×1 PNG probe, degrades every surface to plain frosted glass, and `console.warn`s the reason. **What a refusal leaves on screen is pixel-identical to a plain `blur()` control** (measured 0 px of 57600), so what you lose is the lens itself plus the wasted SDF/PNG work — not a drawing error. Which sites actually hit this: see [§10.8](#108-measured-real-world-csp-spread);
+- **Ancestors cut off the backdrop**: any ancestor with `filter` / `opacity < 1` / `mask` becomes a backdrop root, and the glass can only sample what is inside it;
+- **Static lens**: this is the **filter layer** lifted out of `GlassSurface` — no drop shadow, highlights, press highlight, deformation, gestures or animation driver, so intensity changes require the caller to re-apply options.
+
+### 10.6 Generating, checking and releasing
+
+```bash
+npm run check:userscript    # node --check syntax validation
+npm run stage:userscript    # stamp and write dist/liquid-glass-refract.user.js the way CI does
+npm run dev                 # verify in a browser (paste the script into a test page, see below)
+```
+
+To regenerate (when upstream `src/core/glass-filter.ts` changes), strip types with the project's own tsc — **never hand-copy the algorithm**:
+
+```bash
+./node_modules/.bin/tsc src/core/glass-filter.ts --target es2022 --module esnext --outDir /tmp/strip
+# then drop the `export ` prefixes from /tmp/strip/glass-filter.js and splice it into section 1 of the script
+```
+
+Only **one line** in the script differs from the extraction source: `document.body || document.documentElement` in `svgRoot()`, so it can run before `<body>` exists (which is the case for `@require`).
+
+### 10.7 Measured data (headless Chromium, 320×180 / r=28 / refractionHeight=22)
+
+| Item | Result |
+| --- | --- |
+| Filter graph | 11 primitives, `scale 94.9 ｜ 52 ｜ 94.9`, `filterUnits=userSpaceOnUse`, `color-interpolation-filters=sRGB` |
+| Displacement map | 448×308 (= element + `FILTER_PAD`×2), 17328 rim px of 137984, max deviation 111/127, `data:` URL ≈23 KB |
+| Does refraction reach the screen | Changing only `refractionAmount` 0 → 34: 11995 px differ, maxdelta 77, diff bbox exactly the element box; differences are **entirely at inset ≤ 19px**, 0 px deeper than 20px, 0 px outside the box |
+| CSP `img-src 'none'` | Maps refused (a `securitypolicyviolation` with `img-src`, one per map), `refractionAmount` 0→30 gives **0 px**; against a plain `blur()` control on the same page **0 px of 57600**, i.e. "frosted glass with no lens" |
+| Inclusion idempotence | Including the script twice on one page: only 1 `<filter>`, hotkey log fires once |
+| SPA follow-up | With `autoWatch: true`, a dynamically inserted matching node gets glass within one rAF |
+
+---
+
+### 10.8 Measured: real-world CSP spread
+
+On 2026-09-12 we sampled the root-path response headers of ~70 sites, and ran the script's own probe (`new Image()` + a 1×1 `data:` PNG) in a real browser on four of them:
+
+| Case | Sites (selection) | Lens |
+| --- | --- | --- |
+| `img-src` without `data:` | **stackoverflow.com** / serverfault.com / superuser.com (all `img-src 'self' https://challenges.cloudflare.com`), **pypi.org** | ❌ silent degrade |
+| `img-src` with `data:` | github.com (`img-src 'self' data: blob: …`), gitlab.com, linear.app, vercel.com, nextjs.org (`img-src * blob: data:`), apple.com, www.icloud.com, atlassian.com, stripe.com, docs.qq.com, store.steampowered.com | ✅ |
+| No CSP header on the root | developer.mozilla.org, news.ycombinator.com, google.com / youtube.com, x.com, reddit.com, npmjs.com, claude.ai, chatgpt.com, figma.com, notion.so, zhihu.com, bilibili.com, taobao.com, jd.com, weibo.com, douyin.com, slack.com, discord.com, twitch.tv, wikipedia.org | ✅ |
+
+Real-browser probe results: `stackoverflow.com` → `data: refused`, `pypi.org` → `data: refused`, `github.com` → `data: loadable`, `developer.mozilla.org` → `data: loadable` — matching the header analysis.
+
+Three reading notes:
+
+- **`default-src` is `img-src`'s fallback**: a page that only sets `default-src 'self'` (no `img-src`) refuses the maps too; conversely github.com says `default-src 'none'` yet lets them through because of its explicit `img-src … data: …`.
+- The table only reflects **root-path response headers**. A `<meta http-equiv="Content-Security-Policy">`, a policy sent only on some subpaths, or one added after an SPA route change will not show up — **the script's own probe is the authority** (it runs on the real page).
+- A hit looks like "frosted glass, no lens" — it neither draws anything wrong nor reports an error. The single deciding question is whether that `data:` PNG can be decoded.
 
 ---
 

@@ -2,7 +2,7 @@
 
 > 一个把 Android `Kyant0/AndroidLiquidGlass`（Liquid Glass / Backdrop）的 **Web Liquid Glass** 移植到 Web 的项目。
 
-英文文档见 [`README.en.md`](./README.en.md)。
+英文文档见 [`README.en.md`](./README.en.md)（用户脚本部分同样有完整英文版，见 [English §10](./README.en.md#10-userscript-liquid-glass-refraction)）。
 
 ---
 
@@ -114,6 +114,11 @@ WebLiquidGlass/
 ├── vite.config.ts            # base:'./'，别名 '@'→'./src'，dev 绑定 127.0.0.1:5173
 ├── tsconfig.json
 ├── public/                   # 壁纸等静态资源（useWallpaper 加载）
+├── userscript/
+│   └── liquid-glass-refract.user.js   # ★ 从 core/glass-filter.ts 提取的独立用户脚本（见 §10）
+├── scripts/
+│   └── stamp-userscript.mjs  # 发布时把 run number 打进脚本 @version（见 §10.6）
+├── .github/workflows/deploy.yml       # Pages 部署：构建 Demo + 同步发布用户脚本
 └── src/
     ├── main.ts               # createApp(App).mount('#app')
     ├── App.vue               # 外壳：destination 状态机 + 主题 + Back 按钮 + 布局 epoch
@@ -179,6 +184,10 @@ npm run build
 
 # 预览构建产物（http://127.0.0.1:4173）
 npm run preview
+
+# 用户脚本：语法校验 / 按 CI 的方式打版到 dist/（详见 §10.6）
+npm run check:userscript
+npm run stage:userscript
 ```
 
 `density = 1`，所以 Kotlin 里的 `xx.dp` 常量 1:1 映射成 CSS `px`，不做任何换算。
@@ -229,8 +238,139 @@ npm run preview
 
 - 折射在非 Chromium 浏览器上不可用（已降级为纯模糊）。
 - 部分高频滤镜图有 32 张上限的 LRU 缓存（`mapCache`）。
+- 站点若用 CSP 限制 `img-src`（不允许 `data:`），`<feImage>` 的位移图会被拒绝且**完全静默**——详见 [§10](#10-用户脚本liquid-glass-refraction)。
 - 无头环境（`--dump-dom`）会饿死 `rAF`，弹簧动画只出极少帧——验证动画是否在跑应读 inline transform 是否随时间变化，而非看截图。
 - 后续可探索：把 `glass-filter` 的位移图生成移到 Worker、对非 Chromium 增加 WebGL 折射 fallback（若届时允许引入 WebGL）。
+
+---
+
+## 10. 用户脚本（Liquid Glass Refraction）
+
+`src/core/glass-filter.ts` 是**零依赖**模块（整个文件没有一个 `import`），因此被单独提取成了一个可直接安装的用户脚本，用于把**任意网站上的任意元素**变成液态玻璃折射透镜。
+
+### 10.1 绝对路径
+
+发布走本项目既有的 GitHub Pages 工作流，脚本与 Demo 同源同版本，推送到 `main` 即自动同步：
+
+| 用途 | 绝对路径 |
+| --- | --- |
+| 脚本文件（安装 / `@require` / `@updateURL`） | `https://someonehx.github.io/WebLiquidGlass/liquid-glass-refract.user.js` |
+| Demo 站点（部署根） | `https://someonehx.github.io/WebLiquidGlass/` |
+| 源码（仓库内，随 Pages 一起发布） | `https://github.com/SomeoneHX/WebLiquidGlass/blob/main/userscript/liquid-glass-refract.user.js` |
+
+> Pages 侧的 `@version` 由 CI 按 workflow run number 自动打版（`0.2.<run_number>`），因此每次推送都会产生一个新版本，安装过的人会在管理器下次检查时自动更新。仓库内的文件保留手写的基础版本号，`scripts/stamp-userscript.mjs` 是两者唯一允许不一致的地方。
+
+### 10.2 三种引入方式
+
+```js
+// ① 直接安装（Tampermonkey / Violentmonkey）：打开上面的脚本地址即可，@updateURL 会自动接收更新
+
+// ② 在你自己的用户脚本里 @require 它：
+// @require      https://someonehx.github.io/WebLiquidGlass/liquid-glass-refract.user.js
+// @grant        none
+// 脚本执行后 API 落在 window.LiquidGlassRefract（沙箱模式下用 unsafeWindow 读取）：
+const { apply, unglassify } = window.LiquidGlassRefract
+apply(document.querySelector('.header'), { blur: 12, refractionAmount: 30 })
+
+// ③ 普通网页里直接用 <script src>：
+// <script src="https://someonehx.github.io/WebLiquidGlass/liquid-glass-refract.user.js"></script>
+```
+
+脚本**默认不做任何事**（没有配置就不扫描、不修改任何元素），所以 `@require` 进来是安全的；重复引入会被自身的加载守卫忽略，不会重复绑监听。
+
+### 10.3 配置：在执行脚本前赋值 `window.LiquidGlassRefractConfig`
+
+```js
+window.LiquidGlassRefractConfig = {
+  selectors: ['.header', 'nav'],     // 自动应用的选择器；留空 = 什么都不做
+  autoWatch: true,                   // 用 MutationObserver 跟进 SPA 动态插入的节点（rAF 合并）
+  hotkeys: { glassify: 'alt+shift+g', unglassify: 'alt+shift+u' },  // 或 false 关闭
+  defaults: { blur: 12, refractionHeight: 24 }   // 合并进默认参数
+}
+```
+
+热键作用于**鼠标当前指向的元素**（`document.elementFromPoint`，不依赖焦点），组合键串支持 `alt` / `shift` / `ctrl` / `meta`。
+
+### 10.4 API
+
+| 方法 | 说明 |
+| --- | --- |
+| `apply(el, options?)` | 把元素变成玻璃透镜。与 `glassify` 同一函数，公开名用 `apply` |
+| `glassify(el, options?)` | 同上。对**同一元素**重复调用 = 更新参数（幂等） |
+| `unglassify(el)` | 撤销：恢复此前的 inline 样式、移除 `<filter>`、注销 `ResizeObserver` |
+| `applyAll()` | 立即按 `selectors` 扫描一遍，返回本次新应用的元素数组 |
+| `isRefractionSupported()` | 引擎探针（Chromium 才行） |
+| `createGlassFilter()` | 低层：只拿 SVG 滤镜图（`{ id, update(spec, amount, zoom?, overlay?), dispose() }`），自己写宿主 |
+| `activeCount()` | 当前存活的玻璃面数量 |
+| `DEFAULTS` / `FILTER_PAD` / `config` / `version` | 默认参数、滤镜外扩内边距（64px）、生效配置、版本号 |
+
+`apply` 的参数：
+
+| 参数 | 默认 | 含义 |
+| --- | --- | --- |
+| `blur` / `saturate` / `brightness` | `8` / `1.6` / `1.06` | 与折射同处一条 `backdrop-filter`；也必须靠前者，裸 `url()` 会被 Chromium 静默忽略 |
+| `refractionHeight` | `18` | 从边缘向内多深开始弯曲（px） |
+| `refractionAmount` | `22` | 边缘最大位移（px），直接进 `feDisplacementMap@scale` |
+| `depthEffect` | `true` | 把向心方向混进弯折梯度 |
+| `chromaticAberration` | `false` | 三分支色散：3 张位移图 + 11 段滤镜图 |
+| `maxArea` | `490000` | 面积上限，超过则跳过并 warn（SDF 逐像素逐分支，大元素会卡主线程） |
+
+### 10.5 使用前须知
+
+- **必须自己给 tint**：脚本不改元素自身样式，元素需要有半透明背景（如 `background: rgba(255,255,255,.16)`），否则只有透镜没有磨砂色；
+- **形状即 `border-radius`**：圆角从 computed style 读取，想要胶囊就写 `border-radius: 50%` 或大圆角，位移图按同一几何生成；
+- **仅 Chromium**：Safari / Firefox 会把带 `url()` 的整条声明丢掉，脚本对这类引擎只写纯模糊；
+- **CSP 是硬门槛**：页面若限制 `img-src` 不允许 `data:`，位移图会被拒且不报错（每个 `<feImage>` 触发一次 `securitypolicyviolation`，但控制台不会有任何报错），脚本用 1×1 PNG 探针检出后整体降级为纯磨砂并 `console.warn` 原因。**被拒时最终上屏结果与纯 `blur()` 控制组逐像素相同**（实测 0 px / 57600），所以损失的是"透镜"本身与那份被浪费的 SDF/PNG 计算，而不是画面画错；哪些站点会命中见 [§10.8](#108-实测真实站点的-csp-分布)；
+- **祖先元素会截断 backdrop**：任何带 `filter` / `opacity < 1` / `mask` 的祖先都会成为 backdrop root，玻璃只能采到它内部的内容；
+- **静态透镜**：这是从 `GlassSurface` 抽出的**滤镜层**，不含投影 / 高光 / 按压高光 / 形变 / 手势 / 动画驱动，强度变化需要调用方自己重设参数。
+
+### 10.6 生成、校验与发布
+
+```bash
+npm run check:userscript    # node --check 语法校验
+npm run stage:userscript    # 本地按 CI 的方式打版输出到 dist/liquid-glass-refract.user.js
+npm run dev                 # 浏览器里验证（把脚本粘进测试页即可，见下）
+```
+
+重新生成（若上游 `src/core/glass-filter.ts` 改动）——用项目自带 tsc 剥类型，**不要手抄算法**：
+
+```bash
+./node_modules/.bin/tsc src/core/glass-filter.ts --target es2022 --module esnext --outDir /tmp/strip
+# 再把 /tmp/strip/glass-filter.js 的 `export ` 前缀去掉，拼到脚本的第 1 段之前/之后
+```
+
+脚本内只有**一行**与提取源不同：`svgRoot()` 里 `document.body || document.documentElement`，以便在 `<body>` 存在之前执行（`@require` 就是这种情况）。
+
+### 10.7 实测数据（无头 Chromium，320×180 / r=28 / refractionHeight=22）
+
+| 项 | 结果 |
+| --- | --- |
+| 滤镜图 | 11 个 primitive，`scale 94.9 ｜ 52 ｜ 94.9`，`filterUnits=userSpaceOnUse`、`color-interpolation-filters=sRGB` |
+| 位移图 | 448×308（= 元素 + `FILTER_PAD`×2），rim 17328 / 137984 px，最大偏差 111/127，`data:` URL ≈23 KB |
+| 折射是否上屏 | 仅把 `refractionAmount` 从 0 改到 34：11995 px 不同、maxdelta 77、差异 bbox 恰为元素框；差异**全在 inset ≤ 19px**，≥20px 深 0 px、框外 0 px |
+| CSP `img-src 'none'` | 位移图被拒（`securitypolicyviolation: img-src`，每个 map 一次），`refractionAmount` 0→30 **0 px 差异**；与同页纯 `blur()` 控制组相比 **0 px / 57600**，即"只剩磨砂、没有透镜" |
+| 引入幂等 | 同一页引入两次：只有 1 个 `<filter>`、热键日志只出现 1 次 |
+| SPA 跟进 | `autoWatch: true` 下动态插入的匹配节点在一个 rAF 后自动上玻璃 |
+
+---
+
+### 10.8 实测：真实站点的 CSP 分布
+
+2026-09-12 抽查约 70 个站点的根路径响应头，并在其中 4 个站点上用真实浏览器跑了脚本同款探针（`new Image()` + 1×1 `data:` PNG）：
+
+| 情况 | 站点（节选） | 透镜 |
+| --- | --- | --- |
+| `img-src` 不含 `data:` | **stackoverflow.com** / serverfault.com / superuser.com（均为 `img-src 'self' https://challenges.cloudflare.com`）、**pypi.org** | ❌ 静默降级 |
+| `img-src` 含 `data:` | github.com（`img-src 'self' data: blob: …`）、gitlab.com、linear.app、vercel.com、nextjs.org（`img-src * blob: data:`）、apple.com、www.icloud.com、atlassian.com、stripe.com、docs.qq.com、store.steampowered.com | ✅ |
+| 根路径无 CSP 头 | developer.mozilla.org、news.ycombinator.com、google.com / youtube.com、x.com、reddit.com、npmjs.com、claude.ai、chatgpt.com、figma.com、notion.so、zhihu.com、bilibili.com、taobao.com、jd.com、weibo.com、douyin.com、slack.com、discord.com、twitch.tv、wikipedia.org | ✅ |
+
+真站探针结果（浏览器内实测）：`stackoverflow.com` → `data: 被拒`、`pypi.org` → `data: 被拒`、`github.com` → `data: 可加载`、`developer.mozilla.org` → `data: 可加载`——与头部结论一致。
+
+三点判读说明：
+
+- **`default-src` 是 `img-src` 的兜底**：只写 `default-src 'self'` 而没写 `img-src` 的页面同样会拒；反之 `github.com` 写着 `default-src 'none'` 却因为显式 `img-src … data: …` 而放行。
+- 上表只看**根路径响应头**。`<meta http-equiv="Content-Security-Policy">` 形式、只对部分子路径下发的 CSP、以及 SPA 路由切换后新增的策略都看不到——**以脚本自己的探针为准**（它就在真实页面上跑）。
+- 命中时的表现是"磨砂正常、透镜没有"，不会画错也不会报错；判断依据只有一个：位移图那张 `data:` PNG 能不能被解码。
 
 ---
 

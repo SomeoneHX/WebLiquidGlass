@@ -33,6 +33,21 @@ jobs:
       - name: Build
         run: npm run build
 
+      # The userscript is published from the same artifact as the demo, so it always matches the
+      # commit that was built. Canonical URL (linked from README.md, used by `@require`,
+      # `@updateURL` and `@downloadURL`):
+      #   https://someonehx.github.io/WebLiquidGlass/liquid-glass-refract.user.js
+      # The run number is stamped into @version so a userscript manager sees a new version on
+      # every deploy and actually re-fetches the file.
+      - name: Stage the userscript into the Pages artifact
+        run: |
+          set -euo pipefail
+          node --check userscript/liquid-glass-refract.user.js
+          node scripts/stamp-userscript.mjs "${GITHUB_RUN_NUMBER}" dist/liquid-glass-refract.user.js
+          node --check dist/liquid-glass-refract.user.js
+          test -s dist/liquid-glass-refract.user.js
+          grep -m1 '^// @version' dist/liquid-glass-refract.user.js
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
