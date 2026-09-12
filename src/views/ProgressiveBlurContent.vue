@@ -11,13 +11,13 @@ import { useTheme } from '@/composables/backdrop-context'
 /**
  * `ProgressiveBlurContent` — the alpha-masked progressive blur.
  *
- * Degraded (API < 31): **both** effects are gone. `blur(4.dp)` is a RenderEffect and the
- * `AlphaMask` AGSL shader is a `RuntimeShader`, so on this build the plane is simply the
- * unmodified wallpaper rectangle with the label on top — the gradient is entirely absent.
- * It is the starkest "before/after" in the catalog, which is why it is worth porting as-is.
- *
- * The shader source and its uniforms are kept verbatim so that enabling the full (API 33+)
- * path only requires switching the effect pipeline on.
+ * The AGSL pair (`blur` + `AlphaMask` runtime shader) is re-expressed entirely with CSS on
+ * the lens element: `backdrop-filter: blur(4px)` for the content, the tint as the element
+ * background at `tintIntensity` alpha, and the `smoothstep(size.y, size.y * 0.5, y)` ramp as
+ * a `mask-image`. In premultiplied terms the mask multiplies the whole element by
+ * `blurAlpha`, which makes the output exactly the shader's
+ * `mix(content·blurAlpha, tint·tintAlpha, 0.8)` — see `GlassSurface`. The shader source and
+ * its uniforms are kept verbatim below; the web path reads the recorded uniforms.
  */
 const { isLightTheme } = useTheme()
 
@@ -92,6 +92,11 @@ function effects(scope: BackdropEffectScope): void {
 .progressive__plane {
   width: 100%;
   height: 128px;
+}
+
+/* `contentAlignment = Alignment.Center` — the label sits dead centre of the plane. */
+.progressive__plane :deep(.glass-surface__content) {
+  justify-content: center;
 }
 
 .progressive__label {

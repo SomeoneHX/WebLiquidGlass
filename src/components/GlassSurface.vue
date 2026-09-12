@@ -197,6 +197,47 @@ const contentStyle = computed(() => {
  * backdrop *drop the whole declaration* rather than failing gracefully, so leaving the first
  * write in place is what keeps Safari and Firefox on a plain blur.
  */
+/**
+ * Web re-expression of the catalog's `AlphaMask` runtime shader (`ProgressiveBlurContent`):
+ *
+ * ```
+ * blurAlpha = tintAlpha = smoothstep(size.y, size.y * 0.5, coord.y)
+ * out = mix(content·blurAlpha, tint·tintAlpha, tintIntensity)
+ * ```
+ *
+ * One element carries all of it: `backdrop-filter: blur()` for the content, the tint as the
+ * element background at `tintIntensity` alpha, and the smoothstep ramp as a `mask-image`.
+ * In premultiplied terms the mask multiplies the whole element by `blurAlpha`, so the output
+ * is `blurAlpha·(tintIntensity·tint + (1−tintIntensity)·content)` — exactly the shader's mix.
+ * The gradient stops sample the smoothstep curve (`t = 2(1−y/h)`, `t²(3−2t)`); a linear ramp
+ * would be visibly more "kinked" at the midpoint.
+ */
+const ALPHA_MASK_GRADIENT = (() => {
+  const stops: string[] = ['black 0%', 'black 50%']
+  for (let i = 1; i < 10; i++) {
+    const t = 1 - i / 10 // t = 2(1 − y/h) for y ∈ [h/2, h]
+    const alpha = t * t * (3 - 2 * t)
+    stops.push(`rgba(0, 0, 0, ${alpha.toFixed(3)}) ${(50 + i * 5).toFixed(1)}%`)
+  }
+  return `linear-gradient(to bottom, ${stops.join(', ')})`
+})()
+
+/** `#rrggbb` / `#aarrggbb` → `rgba(r, g, b, alpha)`; anything else passes through untouched. */
+function withAlpha(color: string, alpha: number): string {
+  const hex = color.replace('#', '')
+  const rgb =
+    hex.length === 6
+      ? hex
+      : hex.length === 8 && (hex.startsWith('ff') || hex.startsWith('FF'))
+        ? hex.slice(2)
+        : null
+  if (!rgb || !/^[0-9a-fA-F]{6}$/.test(rgb)) return color
+  const r = parseInt(rgb.slice(0, 2), 16)
+  const g = parseInt(rgb.slice(2, 4), 16)
+  const b = parseInt(rgb.slice(4, 6), 16)
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`
+}
+
 function applyLensStyle(): void {
   const el = lensEl.value
   const width = size.value.width
@@ -224,6 +265,20 @@ function applyLensStyle(): void {
   // Write the portable value first; the refraction write below may or may not be honoured.
   el.style.backdropFilter = base
   el.style.setProperty('-webkit-backdrop-filter', base)
+
+  // `AlphaMask` runtime shader → mask + tint on this same element (see the gradient above).
+  const alphaMask = effectScope.shaderRequests.find((r) => r.key === 'AlphaMask')
+  if (alphaMask) {
+    const intensity = alphaMask.floats.get('tintIntensity')?.[0] ?? 0.8
+    const tint = alphaMask.colors.get('tint')
+    el.style.setProperty('-webkit-mask-image', ALPHA_MASK_GRADIENT)
+    el.style.setProperty('mask-image', ALPHA_MASK_GRADIENT)
+    el.style.backgroundColor = tint ? withAlpha(tint, intensity) : ''
+  } else {
+    el.style.removeProperty('-webkit-mask-image')
+    el.style.removeProperty('mask-image')
+    el.style.backgroundColor = ''
+  }
 
   const refraction = effectScope.refraction
   if (!refraction || !glassFilter) return

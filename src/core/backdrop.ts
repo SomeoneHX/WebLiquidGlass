@@ -34,7 +34,18 @@ export interface RefractionRequest {
   chromaticAberration: boolean
 }
 
-/** Uniform setters handed to a `runtimeShaderEffect { }` block — inert here, typed for parity. */
+/**
+ * A recorded `runtimeShaderEffect` request. The shader source itself has no CSS twin, but
+ * its *uniforms* are recorded verbatim so specific shaders can be re-expressed with the
+ * primitives CSS does have (see `AlphaMask` in `GlassSurface`).
+ */
+export interface RecordedShader {
+  key: string
+  floats: Map<string, number[]>
+  colors: Map<string, string>
+}
+
+/** Uniform setters handed to a `runtimeShaderEffect { }` block — records for the web path. */
 export interface RuntimeShaderUniforms {
   setFloatUniform(name: string, ...values: number[]): void
   setColorUniform(name: string, color: string | number): void
@@ -56,8 +67,8 @@ export class BackdropEffectScope {
   saturation = 1
   /** `lens(...)`, or `null` when the platform cannot refract. */
   refraction: RefractionRequest | null = null
-  /** Recorded for parity; no CSS equivalent (a per-pixel shader over the backdrop). */
-  readonly shaderRequests: string[] = []
+  /** Recorded for the web re-expressions of specific shaders (`AlphaMask`). */
+  readonly shaderRequests: RecordedShader[] = []
 
   reset(): void {
     this.padding = 0
@@ -105,8 +116,10 @@ export class BackdropEffectScope {
   }
 
   /**
-   * Kept at the Kotlin signature so call sites stay 1:1. A per-pixel AGSL shader has no CSS
-   * twin — `backdrop-filter` only accepts fixed filter functions — so this records and stops.
+   * Kept at the Kotlin signature so call sites stay 1:1. The AGSL source has no CSS twin —
+   * `backdrop-filter` only accepts fixed filter functions — but the uniforms are recorded
+   * and specific shaders get web re-expressions where CSS can match them (`AlphaMask` →
+   * `mask-image` + background tint in `GlassSurface`).
    */
   runtimeShaderEffect(
     key: string,
@@ -116,15 +129,19 @@ export class BackdropEffectScope {
   ): void {
     void shaderString
     void inputShaderName
-    void uniforms
-    this.shaderRequests.push(key)
+    const record: RecordedShader = { key, floats: new Map(), colors: new Map() }
+    uniforms?.({
+      setFloatUniform: (name, ...values) => record.floats.set(name, values),
+      setColorUniform: (name, color) => record.colors.set(name, String(color))
+    })
+    this.shaderRequests.push(record)
   }
 
   /** `SdfShader.apply()` — the lock-screen clock texture. */
   sdfTexture(refractionHeight: number, lightAngle: number): void {
     void refractionHeight
     void lightAngle
-    this.shaderRequests.push('SdfShader')
+    this.shaderRequests.push({ key: 'SdfShader', floats: new Map(), colors: new Map() })
   }
 
   /** `backdrop-filter` value, e.g. `blur(8px) saturate(150%) brightness(1.05)`. */
