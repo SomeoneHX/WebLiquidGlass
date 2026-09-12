@@ -5,7 +5,7 @@ import { animationRevision } from '@/core/animation'
 import { BackdropEffectScope, DefaultShadow, HighlightStyles } from '@/core/backdrop'
 import type { Backdrop, Highlight, InnerShadow, Shadow } from '@/core/backdrop'
 import { drawGlassAdditive, drawGlassOverlay, drawGlassShadow } from '@/core/draw-backdrop'
-import { createGlassFilter, type BackdropZoom, type GlassFilterHandle } from '@/core/glass-filter'
+import { createGlassFilter, type BackdropZoom, type CaptureOverlay, type GlassFilterHandle } from '@/core/glass-filter'
 import { identityTransform, layerTransformToCss, type LayerTransform, type Size } from '@/core/geometry'
 import type { InteractiveHighlight } from '@/core/interactive-highlight'
 import type { Shape } from '@/core/shapes'
@@ -71,6 +71,9 @@ const props = defineProps<{
    * refracts it (the upstream draw-then-refract order).
    */
   backdropZoom?: () => BackdropZoom | null
+  /** A static image composited into the captured backdrop before the effects chain — the CSS
+   * stand-in for the upstream "record a hidden layer and sample it" pattern. */
+  captureOverlay?: () => CaptureOverlay | null
   /** Drives the press wash. */
   interactiveHighlight?: InteractiveHighlight | null
   /** Extra class on the clip/transform layer that wraps the slot. */
@@ -302,7 +305,8 @@ function applyLensStyle(): void {
       chromaticAberration: refraction.chromaticAberration
     },
     refraction.refractionAmount,
-    props.backdropZoom?.() ?? null
+    props.backdropZoom?.() ?? null,
+    props.captureOverlay?.() ?? null
   )
   // ⚠ A bare `backdrop-filter: url(#id)` is silently ignored by Chromium — the reference is
   // only honoured when a fixed filter function precedes it — so an empty base still gets a

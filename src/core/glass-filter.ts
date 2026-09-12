@@ -114,6 +114,21 @@ export interface BackdropZoom {
   factor: number
 }
 
+/**
+ * A static image composited *into* the captured backdrop before the effects chain run
+ * (`additive`, alpha respected) — the CSS stand-in for the upstream "record a hidden layer
+ * and sample it" pattern (the bottom tabs' accent row). `x`/`y` are element-local and cheap
+ * to update per frame (the pill slides over a fixed strip); `url` only changes when the
+ * strip's content does.
+ */
+export interface CaptureOverlay {
+  url: string
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
 interface MapEntry {
   url: string
   /** Largest encoded magnitude — the `feDisplacementMap` scale must be multiplied by it. */
@@ -383,9 +398,15 @@ export interface GlassFilterHandle {
    * `refractionHeight` / `refractionAmount` come straight from the `lens { }` block and change
    * every frame while a thumb is pressed, so the map is rebuilt only when the rim geometry
    * settles and the cheap knob — `scale` — is what animates. `zoom`, when given, rides its own
-   * fixed-scale displacement stage ahead of the refraction chain.
+   * fixed-scale displacement stage ahead of the refraction chain; `overlay` is a static image
+   * composited into the capture ahead of the same chain (so the effects refract it too).
    */
-  update(spec: RefractionSpec, amount: number, zoom?: BackdropZoom | null): void
+  update(
+    spec: RefractionSpec,
+    amount: number,
+    zoom?: BackdropZoom | null,
+    overlay?: CaptureOverlay | null
+  ): void
   dispose(): void
 }
 
@@ -458,6 +479,7 @@ export function createGlassFilter(): GlassFilterHandle {
 
   let caMode: boolean | null = null
   let zoomMode: boolean | null = null
+  let overlayMode: boolean | null = null
   let maps: SVGFEImageElement[] = []
   let displacements: SVGFEDisplacementMapElement[] = []
   let nodes: Element[] = []
@@ -467,8 +489,11 @@ export function createGlassFilter(): GlassFilterHandle {
   let zoomDisplacement: SVGFEDisplacementMapElement | null = null
   let zoomMapEl: SVGFEImageElement | null = null
   let zoomKey: string | null = null
+  /** The capture overlay (static image composited into the capture), when present. */
+  let overlayImageEl: SVGFEImageElement | null = null
+  let lastOverlayUrl: string | null = null
 
-  function buildGraph(ca: boolean, zoom: boolean): void {
+  function buildGraph(ca: boolean, zoom: boolean, overlay: boolean): void {
     while (filter.firstChild) filter.removeChild(filter.firstChild)
     maps = []
     displacements = []
@@ -477,6 +502,8 @@ export function createGlassFilter(): GlassFilterHandle {
     zoomDisplacement = null
     zoomMapEl = null
     zoomKey = null
+    overlayImageEl = null
+    lastOverlayUrl = null
 
     // The zoom stage samples with its own fixed scale, and the refraction chain refracts the
     // already-magnified image — the original's `onDrawBackdrop`-then-effects order.
@@ -488,6 +515,16 @@ export function createGlassFilter(): GlassFilterHandle {
       zoomDisplacement = zDisp
       nodes.push(zMap, zDisp)
       chainInput = 'zoomed'
+    }
+
+    // The capture overlay (e.g. the bottom tabs' accent strip) is composited into the capture
+    // BEFORE the effects chain, so refraction and chromatic aberration bend it too.
+    if (overlay) {
+      const oImg = feImageElement('overlay')
+      const oAdd = feAddElement(chainInput, 'overlay', 'composed')
+      overlayImageEl = oImg
+      nodes.push(oImg, oAdd)
+      chainInput = 'composed'
     }
 
     if (!ca) {
@@ -538,13 +575,15 @@ export function createGlassFilter(): GlassFilterHandle {
 
   return {
     id,
-    update(spec, amount, zoom) {
+    update(spec, amount, zoom, overlay) {
       const ca = !!spec.chromaticAberration
       const hasZoom = !!zoom && zoom.factor > 0 && zoom.factor !== 1
-      if (ca !== caMode || hasZoom !== zoomMode) {
+      const hasOverlay = !!overlay && !!overlay.url
+      if (ca !== caMode || hasZoom !== zoomMode || hasOverlay !== overlayMode) {
         caMode = ca
         zoomMode = hasZoom
-        buildGraph(ca, hasZoom)
+        overlayMode = hasOverlay
+        buildGraph(ca, hasZoom, hasOverlay)
       }
 
       const width = Math.round(spec.width + FILTER_PAD * 2)
@@ -586,6 +625,20 @@ export function createGlassFilter(): GlassFilterHandle {
             map.setAttribute('href', entry.url)
           }
         })
+      }
+
+      // The capture overlay's placement is element-local and moves per frame (the pill
+      // slides over a fixed strip) — a cheap attribute write, no image rebuild. `href`
+      // only changes when the strip's content does.
+      if (hasOverlay && overlayImageEl && overlay) {
+        overlayImageEl.setAttribute('x', String(overlay.x))
+        overlayImageEl.setAttribute('y', String(overlay.y))
+        overlayImageEl.setAttribute('width', String(overlay.width))
+        overlayImageEl.setAttribute('height', String(overlay.height))
+        if (overlay.url !== lastOverlayUrl) {
+          lastOverlayUrl = overlay.url
+          overlayImageEl.setAttribute('href', overlay.url)
+        }
       }
 
       // Set every frame — `amount` is the animation knob and changes independently of the

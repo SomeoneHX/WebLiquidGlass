@@ -145,11 +145,12 @@ export class InteractiveHighlight {
     ctx.restore()
   }
 
-  /** Attaches the pointer tracking. Returns a disposer. */
+  /** Attaches the pointer tracking. Returns a disposer. `hitTest` gates where a press may start. */
   attach(
     element: HTMLElement,
     localPoint: (event: PointerEvent) => DragPosition = (event) =>
-      localPointerPosition(element, event.clientX, event.clientY)
+      localPointerPosition(element, event.clientX, event.clientY),
+    hitTest?: (position: DragPosition) => boolean
   ): () => void {
     return inspectDragGestures(
       element,
@@ -179,7 +180,8 @@ export class InteractiveHighlight {
           this.positionAnimation.snapTo(position.x, position.y)
         }
       },
-      localPoint
+      localPoint,
+      hitTest
     )
   }
 }

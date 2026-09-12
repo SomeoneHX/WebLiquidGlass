@@ -144,13 +144,19 @@ export class DampedDragAnimation {
     })
   }
 
-  /** Attaches the drag gesture. Returns a disposer. */
+  /**
+   * Attaches the drag gesture. Returns a disposer. `hitTest` gates where a drag may start:
+   * a pointerdown outside the gate neither presses nor begins a drag (clicks fall through to
+   * the underlying controls) — used when the gesture is attached to a larger element than
+   * the dragged visual, e.g. the bottom tabs' bar.
+   */
   attach(
     element: HTMLElement,
     localPoint: (event: PointerEvent) => DragPosition = (event) => {
       const rect = element.getBoundingClientRect()
       return { x: event.clientX - rect.left, y: event.clientY - rect.top }
-    }
+    },
+    hitTest?: (position: DragPosition) => boolean
   ): () => void {
     return inspectDragGestures(
       element,
@@ -172,7 +178,8 @@ export class DampedDragAnimation {
           this.options.onDrag(this, size, delta)
         }
       },
-      localPoint
+      localPoint,
+      hitTest
     )
   }
 }

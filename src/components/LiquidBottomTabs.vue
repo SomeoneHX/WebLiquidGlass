@@ -2,14 +2,16 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import GlassSurface from './GlassSurface.vue'
+import { FlightIconPath } from '@/core/assets'
 import type { Backdrop, BackdropEffectScope, Highlight, Shadow } from '@/core/backdrop'
-import { HighlightStyles } from '@/core/backdrop'
+import { HighlightStyles, innerShadow } from '@/core/backdrop'
 import { Colors, Palette, toCss, withAlpha } from '@/core/color'
 import { Animatable, spring } from '@/core/animation'
 import { DampedDragAnimation } from '@/core/damped-drag-animation'
 import { EaseOut, coerceIn, lerp, sign } from '@/core/math'
 import { dp, type LayerTransform } from '@/core/geometry'
 import { Capsule } from '@/core/shapes'
+import type { CaptureOverlay } from '@/core/glass-filter'
 import { InteractiveHighlight } from '@/core/interactive-highlight'
 import { useElementMetrics } from '@/composables/useElementMetrics'
 import { useFrameValue } from '@/composables/useFrameValue'
@@ -39,7 +41,6 @@ const emit = defineEmits<{ select: [index: number] }>()
 
 const rootEl = ref<HTMLElement | null>(null)
 const indicator = ref<InstanceType<typeof GlassSurface> | null>(null)
-const indicatorEl = computed(() => (indicator.value?.el as HTMLElement | null) ?? null)
 
 const { size: rootSize } = useElementMetrics(rootEl)
 
@@ -161,7 +162,14 @@ const defaultShadowSpec: Shadow = {
 
 const indicatorEffects = (scope: BackdropEffectScope): void => {
   const progress = animation.pressProgress
-  scope.lens(dp(10) * progress, dp(14) * progress, false, true)
+  // The lens is kept alive at rest (0.01 dp ≈ nothing) so the filter graph — and with it the
+  // accent strip composited by `captureOverlay` — stays active even when nothing refracts.
+  scope.lens(Math.max(dp(10) * progress, 0.01), Math.max(dp(14) * progress, 0.01), false, true)
+}
+
+const indicatorInnerShadow = () => {
+  const progress = animation.pressProgress
+  return innerShadow(dp(8) * progress, 0, dp(8) * progress, 'rgba(0, 0, 0, 0.15)', progress)
 }
 
 function onContainerSurface(ctx: CanvasRenderingContext2D, size: { width: number; height: number }) {
@@ -169,14 +177,18 @@ function onContainerSurface(ctx: CanvasRenderingContext2D, size: { width: number
   ctx.fillRect(0, 0, size.width, size.height)
 }
 
+/**
+ * The indicator's surface washes only — the accent-tinted content (icon + label per cell)
+ * reaches the pill through `captureOverlay`: a static snapshot of the hidden accent row
+ * (`tabsBackdrop` + `ColorFilter.tint(accentColor)` upstream), composited into the pill's
+ * capture inside the filter graph, so the pill's lens refraction and chromatic aberration
+ * bend it exactly like the upstream sample.
+ */
 function onIndicatorSurface(
   ctx: CanvasRenderingContext2D,
   size: { width: number; height: number }
 ) {
   const progress = animation.pressProgress
-  // Stands in for the recorded accent row the Kotlin indicator sampled (`tabsBackdrop`).
-  ctx.fillStyle = toCss(accent.value)
-  ctx.fillRect(0, 0, size.width, size.height)
   ctx.save()
   ctx.globalAlpha = 1 - progress
   ctx.fillStyle = props.isLightTheme ? 'rgba(0, 0, 0, 0.1)' : 'rgba(255, 255, 255, 0.1)'
@@ -188,10 +200,114 @@ function onIndicatorSurface(
   ctx.restore()
 }
 
+/**
+ * Static snapshot of the hidden accent row: every cell's icon + label tinted accent. Only
+ * regenerated when the strip's content or geometry changes (theme / width / tab count) —
+ * never per frame, so the filter's `feImage` href stays stable while the pill slides.
+ */
+const accentSnapshot = ref<{ url: string; width: number; height: number } | null>(null)
+
+function drawAccentSnapshot(): void {
+  const w = Math.max(1, rootSize.value.width - dp(8))
+  const h = dp(56)
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.round(w)
+  canvas.height = Math.round(h)
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  const cell = w / props.tabsCount
+  const accentCss = toCss(accent.value)
+  const iconSize = dp(28)
+  const labelSize = dp(12)
+  const gap = dp(2)
+  ctx.fillStyle = accentCss
+  ctx.font = `${labelSize}px ${getComputedStyle(document.body).fontFamily}`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  for (let i = 0; i < props.tabsCount; i++) {
+    const cx = cell * i + cell / 2
+    const contentHeight = iconSize + gap + labelSize
+    const top = h / 2 - contentHeight / 2
+    ctx.save()
+    ctx.translate(cx - iconSize / 2, top)
+    ctx.scale(iconSize / 960, iconSize / 960)
+    ctx.fill(new Path2D(FlightIconPath))
+    ctx.restore()
+    ctx.fillText(`Tab ${i + 1}`, cx, top + iconSize + gap + labelSize / 2)
+  }
+  accentSnapshot.value = { url: canvas.toDataURL('image/png'), width: w, height: h }
+}
+
+watch(
+  [() => props.isLightTheme, rootSize, () => props.tabsCount],
+  () => drawAccentSnapshot(),
+  { immediate: false }
+)
+
+/**
+ * The snapshot's placement in the pill's local space: the strip is fixed to the bar, the pill
+ * slides over it, so `x` tracks the indicator's translation per frame (cheap attribute write).
+ */
+const captureOverlay = useFrameValue<CaptureOverlay | null>(() => {
+  const snap = accentSnapshot.value
+  if (!snap) return null
+  return {
+    url: snap.url,
+    x: -indicatorTranslation.value,
+    y: 0,
+    width: snap.width,
+    height: snap.height
+  }
+})
+
+function captureOverlayFn(): CaptureOverlay | null {
+  return captureOverlay.value
+}
+
+/**
+ * Evenodd clip that hides the black tab content wherever the pill currently is — including
+ * while the pill is press-scaled (`scaleX/scaleY`, tracking `innerTransform`). Upstream the
+ * indicator's sample = wallpaper + accent row ONLY (`tabsBackdrop` never recorded the black
+ * row); without this, the pill's `backdrop-filter` capture would include the black glyphs,
+ * ghosting against the accent copy painted on the surface.
+ */
+const blackRowClip = useFrameValue(() => {
+  const rowW = Math.max(1, rootSize.value.width - dp(8))
+  const sX = animation.scaleX
+  const sY = animation.scaleY
+  const cx = indicatorTranslation.value + tabWidth.value / 2
+  const hw = (tabWidth.value / 2) * sX
+  const hh = 28 * sY
+  const l = cx - hw
+  const t = 28 - hh
+  const w = hw * 2
+  const h = hh * 2
+  const r = h / 2
+  const n = (v: number) => Math.round(v * 100) / 100
+  return (
+    `path(evenodd, "M0 0 H ${rowW} V 56 H 0 Z ` +
+    `M ${n(l + r)} ${n(t)} H ${n(l + w - r)} A ${n(r)} ${n(r)} 0 0 1 ${n(l + w)} ${n(t + r)} ` +
+    `V ${n(t + h - r)} A ${n(r)} ${n(r)} 0 0 1 ${n(l + w - r)} ${n(t + h)} H ${n(l + r)} ` +
+    `A ${n(r)} ${n(r)} 0 0 1 ${n(l)} ${n(t + h - r)} V ${n(t + r)} A ${n(r)} ${n(r)} 0 0 1 ${n(l + r)} ${n(t)} Z")`
+  )
+})
+
 onMounted(() => {
-  if (indicatorEl.value) {
-    const detachDrag = animation.attach(indicatorEl.value)
-    const detachHighlight = interactiveHighlight.attach(indicatorEl.value)
+  drawAccentSnapshot()
+  if (rootEl.value) {
+    /*
+     * The gestures live on the whole bar, gated to the indicator's cell: Chromium gives
+     * pointer events to the TOPMOST element, so a `pointer-events: auto` indicator would
+     * swallow clicks on the selected tab (Compose dispatches to all overlapping handlers).
+     * With the indicator transparent to pointers, taps land on the tabs underneath and the
+     * press/drag deformation still starts exactly at the indicator's cell.
+     */
+    const inIndicatorCell = (position: { x: number; y: number }): boolean => {
+      const left = dp(4) + indicatorTranslation.value
+      return position.x >= left && position.x <= left + tabWidth.value
+    }
+    const detachDrag = animation.attach(rootEl.value, undefined, inIndicatorCell)
+    const detachHighlight = interactiveHighlight.attach(rootEl.value, undefined, inIndicatorCell)
     onBeforeUnmount(() => {
       detachDrag()
       detachHighlight()
@@ -201,7 +317,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <div ref="rootEl" class="liquid-bottom-tabs">
+  <div ref="rootEl" class="liquid-bottom-tabs" :style="{ '--black-clip': blackRowClip }">
     <GlassSurface
       class="liquid-bottom-tabs__container"
       content-class="liquid-bottom-tabs__row"
@@ -227,8 +343,10 @@ onMounted(() => {
       :highlight="indicatorHighlight"
       :shadow="indicatorShadow"
       :effects="indicatorEffects"
+      :inner-shadow="indicatorInnerShadow"
       :layer-transform="innerTransform"
       :offset="indicatorOffset"
+      :capture-overlay="captureOverlayFn"
       :on-draw-surface="onIndicatorSurface"
     />
   </div>
@@ -239,6 +357,8 @@ onMounted(() => {
   position: relative;
   width: 100%;
   height: 64px;
+  /* Gestures are attached to this root (gated to the indicator's cell) — panning is ours. */
+  touch-action: none;
 }
 
 .liquid-bottom-tabs__container {
@@ -248,11 +368,22 @@ onMounted(() => {
   height: 64px;
 }
 
+/* Transparent to pointers: taps fall through to the tabs underneath (see onMounted). */
 .liquid-bottom-tabs__indicator {
   position: absolute;
   top: 4px;
   height: 56px;
-  pointer-events: auto;
+  pointer-events: none;
   touch-action: none;
+}
+
+/*
+ * The black row is carved open wherever the pill is (evenodd capsule hole, per frame) — the
+ * indicator's capture then sees wallpaper + wash only, and the accent content painted on the
+ * pill's own surface stands in for the upstream `tabsBackdrop` recording. Without it the
+ * black glyphs would show through the pill behind the painted accent content.
+ */
+.liquid-bottom-tabs :deep(.liquid-bottom-tabs__row) {
+  clip-path: var(--black-clip, none);
 }
 </style>

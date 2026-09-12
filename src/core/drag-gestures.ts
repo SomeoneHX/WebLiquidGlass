@@ -28,20 +28,26 @@ export interface DragCallbacks {
 /**
  * Attaches a drag inspector to `element`. Returns a disposer.
  *
+ * `hitTest` gates where a drag may start: a pointerdown that fails it is ignored entirely —
+ * no tracking, no pointer capture — so genuine `click` events still reach the elements
+ * underneath (the bottom tabs' bar re-uses this to keep its tabs clickable).
+ *
  * @param localPoint converts a `PointerEvent` into element-local coordinates.
  */
 export function inspectDragGestures(
   element: HTMLElement,
   callbacks: DragCallbacks,
-  localPoint: (event: PointerEvent) => DragPosition
+  localPoint: (event: PointerEvent) => DragPosition,
+  hitTest?: (position: DragPosition) => boolean
 ): () => void {
   let activeId: number | null = null
   let last: DragPosition = { x: 0, y: 0 }
 
   const down = (event: PointerEvent) => {
     if (activeId !== null) return
-    activeId = event.pointerId
     const position = localPoint(event)
+    if (hitTest && !hitTest(position)) return
+    activeId = event.pointerId
     last = position
     callbacks.onDragStart?.(position)
     callbacks.onDrag({ x: 0, y: 0 }, position)
