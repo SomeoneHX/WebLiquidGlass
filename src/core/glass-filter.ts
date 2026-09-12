@@ -100,6 +100,20 @@ export interface RefractionSpec {
   chromaticAberration?: boolean
 }
 
+/**
+ * The `onDrawBackdrop { withTransform { scale(k, k) } }` magnification
+ * (`MagnifierContent`): the captured backdrop is drawn at `k×` about the lens centre `c`,
+ * i.e. each output pixel `p` samples the source at `q = c + (p − c) / k`. That is a
+ * per-pixel displacement of `d(p) = q − p` — a **linear** field, which bakes into a
+ * displacement map exactly like the refraction does. Chaining this map (fixed scale)
+ * *before* the refraction map (animated scale) composes to `p + d_r(p) + d_zoom(p + d_r(p))`
+ * — the exact original semantics of refracting the already-magnified backdrop.
+ */
+export interface BackdropZoom {
+  /** The `scale(k, k)` factor, about the lens centre. */
+  factor: number
+}
+
 interface MapEntry {
   url: string
   /** Largest encoded magnitude — the `feDisplacementMap` scale must be multiplied by it. */
@@ -288,6 +302,76 @@ function refractionMap(spec: RefractionSpec, branch: 1 | 0 | -1): MapEntry {
   return entry
 }
 
+/**
+ * The magnification displacement map: `d(p) = c + (p − c)/k − p` about the element centre,
+ * neutral outside the box. Linear, so `vmax` is the largest corner magnitude; the
+ * `feDisplacementMap` runs at a *fixed* `scale = 2·vmax` (the zoom does not participate in
+ * the refraction's animation).
+ */
+function buildZoomMap(width: number, height: number, zoom: BackdropZoom): MapEntry {
+  const w = Math.max(1, Math.round(width))
+  const h = Math.max(1, Math.round(height))
+  const cw = w + FILTER_PAD * 2
+  const ch = h + FILTER_PAD * 2
+  const canvas = document.createElement('canvas')
+  canvas.width = cw
+  canvas.height = ch
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return { url: '', vmax: 1 }
+
+  const image = ctx.createImageData(cw, ch)
+  const data = image.data
+  const k = zoom.factor
+  const cx = w / 2
+  const cy = h / 2
+
+  // Corner magnitudes of the linear field, the largest of which sets the encoding range.
+  let vmax = 0
+  for (const [x, y] of [
+    [0, 0],
+    [w, 0],
+    [0, h],
+    [w, h]
+  ]) {
+    const magnitude = Math.hypot(cx + (x - cx) / k - x, cy + (y - cy) / k - y)
+    if (magnitude > vmax) vmax = magnitude
+  }
+  const s = vmax > 0 ? 127 / vmax : 0
+
+  for (let j = 0; j < ch; j++) {
+    const y = j - FILTER_PAD
+    for (let i = 0; i < cw; i++) {
+      const x = i - FILTER_PAD
+      const index = (j * cw + i) * 4
+      data[index] = 128
+      data[index + 1] = 128
+      data[index + 2] = 128
+      data[index + 3] = 255
+      if (x < 0 || x >= w || y < 0 || y >= h) continue
+      const dx = cx + (x - cx) / k - x
+      const dy = cy + (y - cy) / k - y
+      data[index] = clampByte(128 + dx * s)
+      data[index + 1] = clampByte(128 + dy * s)
+    }
+  }
+
+  ctx.putImageData(image, 0, 0)
+  return { url: canvas.toDataURL('image/png'), vmax: vmax > 0 ? vmax : 1 }
+}
+
+function zoomMap(width: number, height: number, zoom: BackdropZoom): MapEntry {
+  const key = `z|${Math.round(width)}x${Math.round(height)}|${zoom.factor}`
+  const hit = mapCache.get(key)
+  if (hit !== undefined) return hit
+  const entry = buildZoomMap(width, height, zoom)
+  if (mapCache.size >= MAP_LIMIT) {
+    const oldest = mapCache.keys().next().value
+    if (oldest !== undefined) mapCache.delete(oldest)
+  }
+  if (entry.url) mapCache.set(key, entry)
+  return entry
+}
+
 /* ------------------------------------------------------------------------------------------- */
 /* Filter element                                                                                */
 /* ------------------------------------------------------------------------------------------- */
@@ -298,9 +382,10 @@ export interface GlassFilterHandle {
   /**
    * `refractionHeight` / `refractionAmount` come straight from the `lens { }` block and change
    * every frame while a thumb is pressed, so the map is rebuilt only when the rim geometry
-   * settles and the cheap knob — `scale` — is what animates.
+   * settles and the cheap knob — `scale` — is what animates. `zoom`, when given, rides its own
+   * fixed-scale displacement stage ahead of the refraction chain.
    */
-  update(spec: RefractionSpec, amount: number): void
+  update(spec: RefractionSpec, amount: number, zoom?: BackdropZoom | null): void
   dispose(): void
 }
 
@@ -372,22 +457,42 @@ export function createGlassFilter(): GlassFilterHandle {
   filter.setAttribute('color-interpolation-filters', 'sRGB')
 
   let caMode: boolean | null = null
+  let zoomMode: boolean | null = null
   let maps: SVGFEImageElement[] = []
   let displacements: SVGFEDisplacementMapElement[] = []
   let nodes: Element[] = []
   /** Per map node: the cache key its `href` was last set from — identical strings are skipped. */
   let mapKeys: (string | null)[] = []
+  /** The stage that runs ahead of the refraction chain (the zoom), when present. */
+  let zoomDisplacement: SVGFEDisplacementMapElement | null = null
+  let zoomMapEl: SVGFEImageElement | null = null
+  let zoomKey: string | null = null
 
-  function buildGraph(ca: boolean): void {
+  function buildGraph(ca: boolean, zoom: boolean): void {
     while (filter.firstChild) filter.removeChild(filter.firstChild)
     maps = []
     displacements = []
     mapKeys = []
     nodes = []
+    zoomDisplacement = null
+    zoomMapEl = null
+    zoomKey = null
+
+    // The zoom stage samples with its own fixed scale, and the refraction chain refracts the
+    // already-magnified image — the original's `onDrawBackdrop`-then-effects order.
+    let chainInput = 'SourceGraphic'
+    if (zoom) {
+      const zMap = feImageElement('zmap')
+      const zDisp = feDisplacementElement('SourceGraphic', 'zmap', 'zoomed')
+      zoomMapEl = zMap
+      zoomDisplacement = zDisp
+      nodes.push(zMap, zDisp)
+      chainInput = 'zoomed'
+    }
 
     if (!ca) {
       const map = feImageElement('map')
-      const displace = feDisplacementElement('SourceGraphic', 'map')
+      const displace = feDisplacementElement(chainInput, 'map')
       maps.push(map)
       displacements.push(displace)
       mapKeys.push(null)
@@ -396,9 +501,9 @@ export function createGlassFilter(): GlassFilterHandle {
       const mapR = feImageElement('mapR')
       const mapG = feImageElement('mapG')
       const mapB = feImageElement('mapB')
-      const srcR = feChannelElement('SourceGraphic', 'r', 'srcR')
-      const srcG = feChannelElement('SourceGraphic', 'g', 'srcG')
-      const srcB = feChannelElement('SourceGraphic', 'b', 'srcB')
+      const srcR = feChannelElement(chainInput, 'r', 'srcR')
+      const srcG = feChannelElement(chainInput, 'g', 'srcG')
+      const srcB = feChannelElement(chainInput, 'b', 'srcB')
       const dispR = feDisplacementElement('srcR', 'mapR', 'dispR')
       const dispG = feDisplacementElement('srcG', 'mapG', 'dispG')
       const dispB = feDisplacementElement('srcB', 'mapB', 'dispB')
@@ -433,11 +538,13 @@ export function createGlassFilter(): GlassFilterHandle {
 
   return {
     id,
-    update(spec, amount) {
+    update(spec, amount, zoom) {
       const ca = !!spec.chromaticAberration
-      if (ca !== caMode) {
+      const hasZoom = !!zoom && zoom.factor > 0 && zoom.factor !== 1
+      if (ca !== caMode || hasZoom !== zoomMode) {
         caMode = ca
-        buildGraph(ca)
+        zoomMode = hasZoom
+        buildGraph(ca, hasZoom)
       }
 
       const width = Math.round(spec.width + FILTER_PAD * 2)
@@ -454,6 +561,17 @@ export function createGlassFilter(): GlassFilterHandle {
           node.setAttribute('height', String(height))
         }
         lastMapKey = ''
+      }
+
+      if (hasZoom && zoomDisplacement && zoomMapEl) {
+        const key = `z|${Math.round(spec.width)}x${Math.round(spec.height)}|${zoom!.factor}`
+        if (key !== zoomKey) {
+          zoomKey = key
+          const entry = zoomMap(spec.width, spec.height, zoom!)
+          if (entry.url) zoomMapEl.setAttribute('href', entry.url)
+          // Fixed scale — the magnification does not animate with the refraction amount.
+          zoomDisplacement.setAttribute('scale', String(entry.vmax * 2))
+        }
       }
 
       const key = mapKey(spec, ca ? 1 : 0)

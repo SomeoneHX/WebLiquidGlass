@@ -1,4 +1,4 @@
-import type { Highlight, Shadow } from './backdrop'
+import type { Highlight, InnerShadow, Shadow } from './backdrop'
 import {
   identityTransform,
   type LayerTransform,
@@ -54,6 +54,8 @@ export interface GlassShadowOptions extends GlassDecorOptions {
 export interface GlassOverlayOptions extends GlassDecorOptions {
   highlight?: Highlight | null
   onDrawSurface?: (ctx: CanvasRenderingContext2D, size: Size) => void
+  /** `innerShadow { }` — e.g. the magnifier lens' `InnerShadow(radius = 16.dp)`. */
+  innerShadow?: InnerShadow | null
 }
 
 /** Additive pass: everything upstream draws with `BlendMode.Plus`. */
@@ -283,19 +285,77 @@ function paintRing(
 }
 
 /**
- * Overlay pass — the surface wash and the **non-additive** ring, clipped to the shape and drawn
- * on top of the backdrop layer under ordinary alpha compositing.
+ * `InnerShadowNode` — the classic inner-shadow recipe on a scratch bitmap:
+ *
+ * 1. the shape's blurred silhouette, offset by the shadow offset;
+ * 2. the *shifted* shape carved back out (`destination-out`) — what survives is the crescent
+ *    the offset exposed, i.e. the shadow hugging the edge the shape moved away from;
+ * 3. composited into the shape-clipped overlay at the shadow colour's alpha.
+ *
+ * With the default `offsetY = radius` the crescent sits at the **top** edge, like Compose's.
+ */
+function paintInnerShadow(
+  ctx: CanvasRenderingContext2D,
+  shape: Shape,
+  width: number,
+  height: number,
+  margin: number,
+  shadow: InnerShadow
+): void {
+  const totalWidth = width + margin * 2
+  const totalHeight = height + margin * 2
+  const matrix = ctx.getTransform()
+  const dpr = matrix.a || 1
+  const pixelWidth = Math.max(1, Math.round(totalWidth * dpr))
+  const pixelHeight = Math.max(1, Math.round(totalHeight * dpr))
+  const scratch = obtainScratch(pixelWidth, pixelHeight)
+  if (!scratch) return
+
+  scratch.setTransform(dpr, 0, 0, dpr, margin * dpr, margin * dpr)
+  // Draw in the shadow's own colour (alpha included) — the crescent that survives the carve
+  // then carries exactly `color`'s alpha, and `ctx.globalAlpha = shadow.alpha` scales the
+  // layer as usual. Painting opaque black here gave the magnifier a solid-black arc instead
+  // of `rgba(0, 0, 0, 0.15)`.
+  scratch.shadowColor = shadow.color
+  // canvas `shadowBlur` is 2 * sigma; BlurMaskFilter(radius) ~= sigma radius / 2.
+  scratch.shadowBlur = shadow.radius * 2
+  scratch.shadowOffsetX = shadow.offsetX
+  scratch.shadowOffsetY = shadow.offsetY
+  scratch.fillStyle = shadow.color
+  shape.buildPath(scratch, width, height)
+  scratch.fill()
+
+  scratch.shadowBlur = 0
+  scratch.shadowOffsetX = 0
+  scratch.shadowOffsetY = 0
+  scratch.globalCompositeOperation = 'destination-out'
+  scratch.translate(shadow.offsetX, shadow.offsetY)
+  shape.buildPath(scratch, width, height)
+  scratch.fill()
+  scratch.setTransform(1, 0, 0, 1, 0, 0)
+  scratch.globalCompositeOperation = 'source-over'
+
+  ctx.save()
+  ctx.globalAlpha = shadow.alpha
+  ctx.translate(-margin, -margin)
+  ctx.drawImage(scratch.canvas, 0, 0, totalWidth, totalHeight)
+  ctx.restore()
+}
+
+/**
+ * Overlay pass — the surface wash, the inner shadow and the **non-additive** ring, clipped to
+ * the shape and drawn on top of the backdrop layer under ordinary alpha compositing.
  */
 export function drawGlassOverlay(
   ctx: CanvasRenderingContext2D,
   options: GlassOverlayOptions
 ): void {
-  const { shape, size, highlight = null, onDrawSurface } = options
+  const { shape, size, highlight = null, onDrawSurface, innerShadow = null } = options
   const layerTransform = options.layerTransform ?? identityTransform
   const width = size.width
   const height = size.height
   const ring = hasRing(highlight) && !highlight.additive ? highlight : null
-  if (!onDrawSurface && !ring) return
+  if (!onDrawSurface && !ring && !innerShadow) return
 
   ctx.save()
   ctx.globalAlpha = layerTransform.alpha
@@ -307,6 +367,9 @@ export function drawGlassOverlay(
   ctx.clip()
 
   if (onDrawSurface) onDrawSurface(ctx, size)
+  if (innerShadow) {
+    paintInnerShadow(ctx, shape, width, height, options.margin, innerShadow)
+  }
   if (ring) paintRing(ctx, shape, width, height, options.margin, ring, layerTransform.alpha)
 
   ctx.restore()

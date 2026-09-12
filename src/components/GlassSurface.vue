@@ -3,9 +3,9 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { animationRevision } from '@/core/animation'
 import { BackdropEffectScope, DefaultShadow, HighlightStyles } from '@/core/backdrop'
-import type { Backdrop, Highlight, Shadow } from '@/core/backdrop'
+import type { Backdrop, Highlight, InnerShadow, Shadow } from '@/core/backdrop'
 import { drawGlassAdditive, drawGlassOverlay, drawGlassShadow } from '@/core/draw-backdrop'
-import { createGlassFilter, type GlassFilterHandle } from '@/core/glass-filter'
+import { createGlassFilter, type BackdropZoom, type GlassFilterHandle } from '@/core/glass-filter'
 import { identityTransform, layerTransformToCss, type LayerTransform, type Size } from '@/core/geometry'
 import type { InteractiveHighlight } from '@/core/interactive-highlight'
 import type { Shape } from '@/core/shapes'
@@ -63,6 +63,14 @@ const props = defineProps<{
   shadow?: () => Shadow | null
   /** `onDrawSurface = { drawRect(...) }` */
   onDrawSurface?: (ctx: CanvasRenderingContext2D, size: Size) => void
+  /** `innerShadow { }` — defaults to null, unlike `highlight` / `shadow`. */
+  innerShadow?: () => InnerShadow | null
+  /**
+   * The `onDrawBackdrop { withTransform { scale; translate } }` magnification — the captured
+   * backdrop is drawn at `factor×` with the translate applied, before the effects chain
+   * refracts it (the upstream draw-then-refract order).
+   */
+  backdropZoom?: () => BackdropZoom | null
   /** Drives the press wash. */
   interactiveHighlight?: InteractiveHighlight | null
   /** Extra class on the clip/transform layer that wraps the slot. */
@@ -262,9 +270,6 @@ function applyLensStyle(): void {
   props.effects?.(effectScope)
 
   const base = effectScope.backdropFilterCss()
-  // Write the portable value first; the refraction write below may or may not be honoured.
-  el.style.backdropFilter = base
-  el.style.setProperty('-webkit-backdrop-filter', base)
 
   // `AlphaMask` runtime shader → mask + tint on this same element (see the gradient above).
   const alphaMask = effectScope.shaderRequests.find((r) => r.key === 'AlphaMask')
@@ -281,7 +286,11 @@ function applyLensStyle(): void {
   }
 
   const refraction = effectScope.refraction
-  if (!refraction || !glassFilter) return
+  if (!refraction || !glassFilter) {
+    el.style.backdropFilter = base
+    el.style.setProperty('-webkit-backdrop-filter', base)
+    return
+  }
 
   glassFilter.update(
     {
@@ -292,13 +301,16 @@ function applyLensStyle(): void {
       depthEffect: refraction.depthEffect,
       chromaticAberration: refraction.chromaticAberration
     },
-    refraction.refractionAmount
+    refraction.refractionAmount,
+    props.backdropZoom?.() ?? null
   )
-  el.style.backdropFilter = base ? `${base} url(#${glassFilter.id})` : `url(#${glassFilter.id})`
-  el.style.setProperty(
-    '-webkit-backdrop-filter',
-    base ? `${base} url(#${glassFilter.id})` : `url(#${glassFilter.id})`
-  )
+  // ⚠ A bare `backdrop-filter: url(#id)` is silently ignored by Chromium — the reference is
+  // only honoured when a fixed filter function precedes it — so an empty base still gets a
+  // no-op `blur(0px)` prefix (the magnifier lens has no blur/vibrancy of its own; without
+  // the prefix its entire filter graph never runs, with no console error).
+  const value = `${base || 'blur(0px)'} url(#${glassFilter.id})`
+  el.style.backdropFilter = value
+  el.style.setProperty('-webkit-backdrop-filter', value)
 }
 
 /**
@@ -388,7 +400,8 @@ function redraw() {
       margin: OVERLAY_MARGIN,
       layerTransform: transform,
       highlight: currentHighlight(),
-      onDrawSurface: props.onDrawSurface
+      onDrawSurface: props.onDrawSurface,
+      innerShadow: props.innerShadow?.() ?? null
     })
   })
 

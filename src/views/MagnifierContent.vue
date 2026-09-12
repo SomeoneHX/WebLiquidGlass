@@ -4,6 +4,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import BackdropDemoScaffold from '@/components/BackdropDemoScaffold.vue'
 import GlassSurface from '@/components/GlassSurface.vue'
 import type { BackdropEffectScope } from '@/core/backdrop'
+import { innerShadow } from '@/core/backdrop'
 import { LoremIpsum } from '@/core/assets'
 import { dp } from '@/core/geometry'
 import { inspectDragGestures } from '@/core/drag-gestures'
@@ -19,13 +20,12 @@ import { useTheme } from '@/composables/backdrop-context'
  * recorded layers (`contentBackdrop`, `cursorBackdrop`) plus a hand-rasterised copy of the
  * paragraph for exactly that; none of it is needed now.
  *
- * ⚠ Known gap — magnification. The original `onDrawBackdrop` re-drew the captured backdrop at
- * 1.5× about the lens centre, which is what makes the text look magnified. `backdrop-filter`
- * alone cannot do that: a `transform: scale()` on the lens *widens the sampled region* instead
- * of enlarging it, because the spec inverts the transform before sampling (Filter Effects L2
- * § 2.1). Restoring it means adding a **zoom term** to the displacement map — a displacement
- * proportional to the distance from the centre, which `feDisplacementMap` expresses fine — and
- * that is not wired up yet, so the lens currently refracts without magnifying.
+ * The magnification is the `onDrawBackdrop { withTransform { scale(1.5) } }` re-expressed as
+ * a **zoom displacement stage** in the filter graph (`backdrop-zoom`): the captured backdrop
+ * sampled at `c + (p − c)/1.5` is a per-pixel displacement of `d(p) = q − p`, a linear field
+ * baked into its own map. Chained *ahead* of the refraction maps (which keep their animated
+ * scale) it composes to the exact upstream semantics — refracting the already-magnified
+ * backdrop. The `InnerShadow(16.dp)` rides the overlay canvas.
  */
 const { isLightTheme } = useTheme()
 
@@ -63,8 +63,21 @@ const cursorStyle = computed(() => ({
 }))
 
 const lensStyle = computed(() => ({
-  transform: `translate(${cursorOffset.value.x}px, ${cursorOffset.value.y - dp(80)}px)`
+  left: `calc(50% + ${cursorOffset.value.x}px)`,
+  top: `calc(50% + ${cursorOffset.value.y - dp(80)}px)`
 }))
+
+/**
+ * The magnification: `onDrawBackdrop { withTransform { scale(1.5f, 1.5f) } }` — a 1.5×
+ * centre zoom re-expressed as a zoom displacement stage in the filter graph (`backdrop-zoom`).
+ * The upstream `translate(top = -80f.dp)` offset is dropped: it shifted the zoom's sampling
+ * pivot below the lens, and keeping every sample inside the capture element's own region is
+ * the only behaviour Chromium guarantees.
+ */
+const backdropZoom = () => ({ factor: 1.5 })
+
+/** `innerShadow = { InnerShadow(radius = 16f.dp) }` */
+const lensInnerShadow = () => innerShadow(dp(16))
 
 function effects(scope: BackdropEffectScope): void {
   scope.lens(dp(8), dp(24), true, true)
@@ -91,6 +104,8 @@ function effects(scope: BackdropEffectScope): void {
         :backdrop="backdrop"
         :shape="Capsule"
         :effects="effects"
+        :inner-shadow="lensInnerShadow"
+        :backdrop-zoom="backdropZoom"
       />
     </div>
   </BackdropDemoScaffold>
@@ -133,6 +148,13 @@ function effects(scope: BackdropEffectScope): void {
   cursor: grab;
 }
 
+/*
+ * The lens is positioned with `left`/`top`, NOT a CSS `transform`: Chromium silently
+ * disables a `backdrop-filter: url(#…)` whose element sits inside a transformed ancestor
+ * (the capture degrades to the untransformed backdrop), while plain `blur` keeps working —
+ * which is why every other surface (transforms all `none` at rest) never exposed this.
+ * A pure translation is exactly equivalent to moving `left`/`top`.
+ */
 .magnifier__lens {
   position: absolute;
   left: 50%;
