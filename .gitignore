@@ -5,3 +5,6 @@ dist-ssr
 .DS_Store
 .vite
 *.log
+
+# AI 工作记忆与调试截图，不进仓库
+.workbuddy/
