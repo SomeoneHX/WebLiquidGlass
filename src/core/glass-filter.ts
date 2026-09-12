@@ -14,6 +14,22 @@
  * the same construction as the AGSL `RoundedRectRefractionShaderString` the Android build
  * runs on API 33+, minus the SDF texture lookup.
  *
+ * ## Chromatic aberration
+ *
+ * The AGSL dispersion shader (`RoundedRectRefractionWithDispersionShaderString`) samples
+ * the backdrop 7 times along the refraction offset with spectral weights. `feDisplacementMap`
+ * displaces every channel by the *same* vector, so the port bakes the spectral split into
+ * three displacement maps — red `base·(1+i)`, green `base`, blue `base·(1−i)` where
+ * `i = cx·cy/(hw·hh)` is the shader's `dispersionIntensity` (zero on the axes, strongest in
+ * two opposite quadrants) — displaces a channel-isolated copy of the backdrop with each, and
+ * re-adds the branches with `feComposite arithmetic`. Three taps instead of seven: the
+ * cross-channel bleed of the middle spectral bands is dropped, which at a few px of
+ * dispersion is visually indistinguishable, and white is conserved either way.
+ *
+ * The `chromaticAberration` uniform is a *boolean* upstream (`Lens.kt` passes a constant
+ * `1f`), so the dispersion field depends only on geometry and bakes into the maps; the
+ * animation knob stays `refractionAmount`, which every branch is linear in.
+ *
  * ## Chromium-only
  *
  * `url()` inside `backdrop-filter` is a Chromium extension (Chrome / Edge 76+). Safari and
@@ -78,14 +94,27 @@ export interface RefractionSpec {
   cornerRadii: readonly number[]
   /** `refractionHeight` — how far in from the rim the bend reaches. */
   refractionHeight: number
+  /** `depthEffect` — blend the centripetal direction into the gradient (Shaders.kt:117). */
+  depthEffect?: boolean
+  /** `chromaticAberration` — bake the spectral split, use the three-branch filter graph. */
+  chromaticAberration?: boolean
 }
 
-const mapCache = new Map<string, string>()
+interface MapEntry {
+  url: string
+  /** Largest encoded magnitude — the `feDisplacementMap` scale must be multiplied by it. */
+  vmax: number
+}
+
+const mapCache = new Map<string, MapEntry>()
 const MAP_LIMIT = 32
 
-function mapKey(spec: RefractionSpec): string {
+function mapKey(spec: RefractionSpec, branch: 1 | 0 | -1): string {
   const r = spec.cornerRadii.map((v) => Math.round(v * 2) / 2).join(',')
-  return `${Math.round(spec.width)}x${Math.round(spec.height)}|${r}|${Math.round(spec.refractionHeight)}`
+  const flags = `${spec.depthEffect ? 1 : 0}${spec.chromaticAberration ? 1 : 0}`
+  return `${Math.round(spec.width)}x${Math.round(spec.height)}|${r}|${Math.round(
+    spec.refractionHeight
+  )}|${flags}|${branch}`
 }
 
 /**
@@ -114,9 +143,9 @@ function sdf(
 }
 
 /**
- * `gradSdRoundedRect` — the shader takes its gradient from a *different* shape than the one it
- * uses for depth: the corner radius there is `min(radius * 1.5, min(halfSize))`. For a Capsule
- * the two coincide; for a small radius on a tall box they do not, and the bend fans out.
+ * SDF used for the *gradient*, mirroring the shader: the corner radius there is
+ * `min(radius * 1.5, min(halfSize))`. For a Capsule the two coincide; for a small radius on a
+ * tall box they do not, and the bend fans out.
  */
 function gradSdf(
   x: number,
@@ -138,7 +167,17 @@ function gradSdf(
   return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - r
 }
 
-function buildMap(spec: RefractionSpec): string {
+function clampByte(value: number): number {
+  return Math.max(0, Math.min(255, Math.round(value)))
+}
+
+/**
+ * One displacement-map bitmap. `branch` selects the spectral copy: `+1` red (`base·(1+i)`),
+ * `0` green (`base`), `-1` blue (`base·(1−i)`). Encoded magnitudes are normalised to the
+ * branch's own maximum so the 8-bit channel never clips (red/blue reach `2·base` at a sharp
+ * corner); the lost factor is restored exactly by a per-branch `scale`.
+ */
+function buildMap(spec: RefractionSpec, branch: 1 | 0 | -1): MapEntry {
   const w = Math.max(1, Math.round(spec.width))
   const h = Math.max(1, Math.round(spec.height))
   const cw = w + FILTER_PAD * 2
@@ -147,14 +186,21 @@ function buildMap(spec: RefractionSpec): string {
   canvas.width = cw
   canvas.height = ch
   const ctx = canvas.getContext('2d')
-  if (!ctx) return ''
+  if (!ctx) return { url: '', vmax: 1 }
 
   const image = ctx.createImageData(cw, ch)
   const data = image.data
   const [tl, tr, br, bl] = spec.cornerRadii
   const bezel = Math.max(0.5, spec.refractionHeight)
+  const depth = spec.depthEffect ? 1 : 0
+  const hw = w / 2
+  const hh = h / 2
   const at = (x: number, y: number) => sdf(x, y, w, h, tl, tr, br, bl)
   const gradAt = (x: number, y: number) => gradSdf(x, y, w, h, tl, tr, br, bl)
+
+  /** Rim pixels, collected in pass 1 and encoded in pass 2 once `vmax` is known. */
+  const rim: { index: number; gx: number; gy: number; m: number }[] = []
+  let vmax = 0
 
   for (let j = 0; j < ch; j++) {
     const y = j - FILTER_PAD
@@ -178,37 +224,68 @@ function buildMap(spec: RefractionSpec): string {
       const t = Math.min(1, Math.max(0, 1 + d / bezel))
       const falloff = 1 - Math.sqrt(Math.max(0, 1 - t * t))
 
-      const gx = gradAt(x + 1, y) - gradAt(x - 1, y)
-      const gy = gradAt(x, y + 1) - gradAt(x, y - 1)
-      const length = Math.hypot(gx, gy) || 1
+      let gx = gradAt(x + 1, y) - gradAt(x - 1, y)
+      let gy = gradAt(x, y + 1) - gradAt(x, y - 1)
+      let length = Math.hypot(gx, gy)
+      if (length > 0) {
+        gx /= length
+        gy /= length
+      }
+      if (depth !== 0) {
+        // `grad + depthEffect * normalize(centeredCoord)`, renormalised — the analytic
+        // `gradSdRoundedRect` gradient is unit length, and so is this finite-difference one.
+        const cx = x - hw
+        const cy = y - hh
+        const centreLength = Math.hypot(cx, cy)
+        if (centreLength > 0) {
+          gx += cx / centreLength
+          gy += cy / centreLength
+          length = Math.hypot(gx, gy)
+          if (length > 0) {
+            gx /= length
+            gy /= length
+          }
+        }
+      }
 
-      // ⚠️ Inward. `lens()` passes `refractionAmount` with a *negated* sign and `gradient`
-      // points outward, so in the shader `refractedCoord = coord + d * grad` lands farther
-      // *inside* the shape: the rim shows content from deeper within, which is what squeezes
-      // the backdrop at the edge. Sampling outward instead drags the surrounding wallpaper in
-      // — a bright blue wedge appears wherever the backdrop just outside the rim is a
-      // different colour than the backdrop under it.
-      data[index] = 128 - (gx / length) * falloff * 127
-      data[index + 1] = 128 - (gy / length) * falloff * 127
+      // The shader's `dispersionIntensity` — `chromaticAberration` is baked as the constant 1.
+      const dispersion = ((x - hw) * (y - hh)) / (hw * hh)
+      const m = falloff * (1 + branch * dispersion)
+      if (m > vmax) vmax = m
+      rim.push({ index, gx, gy, m })
     }
   }
 
+  const k = vmax > 0 ? 127 / vmax : 0
+  for (const pixel of rim) {
+    if (pixel.m <= 0) continue
+    const s = pixel.m * k
+    // ⚠️ Inward. `lens()` passes `refractionAmount` with a *negated* sign and `gradient`
+    // points outward, so in the shader `refractedCoord = coord + d * grad` lands farther
+    // *inside* the shape: the rim shows content from deeper within, which is what squeezes
+    // the backdrop at the edge. Sampling outward instead drags the surrounding wallpaper in
+    // — a bright blue wedge appears wherever the backdrop just outside the rim is a
+    // different colour than the backdrop under it.
+    data[pixel.index] = clampByte(128 - pixel.gx * s)
+    data[pixel.index + 1] = clampByte(128 - pixel.gy * s)
+  }
+
   ctx.putImageData(image, 0, 0)
-  return canvas.toDataURL('image/png')
+  return { url: canvas.toDataURL('image/png'), vmax: vmax > 0 ? vmax : 1 }
 }
 
-/** Displacement map for `spec`, memoised — identical shapes share one bitmap. */
-export function refractionMapUrl(spec: RefractionSpec): string {
-  const key = mapKey(spec)
+/** Displacement map for `spec` and spectral `branch`, memoised — identical shapes share one bitmap. */
+function refractionMap(spec: RefractionSpec, branch: 1 | 0 | -1): MapEntry {
+  const key = mapKey(spec, branch)
   const hit = mapCache.get(key)
   if (hit !== undefined) return hit
-  const url = buildMap(spec)
+  const entry = buildMap(spec, branch)
   if (mapCache.size >= MAP_LIMIT) {
     const oldest = mapCache.keys().next().value
     if (oldest !== undefined) mapCache.delete(oldest)
   }
-  if (url) mapCache.set(key, url)
-  return url
+  if (entry.url) mapCache.set(key, entry)
+  return entry
 }
 
 /* ------------------------------------------------------------------------------------------- */
@@ -227,10 +304,61 @@ export interface GlassFilterHandle {
   dispose(): void
 }
 
+function feImageElement(result: string): SVGFEImageElement {
+  const el = document.createElementNS(SVG_NS, 'feImage')
+  el.setAttribute('result', result)
+  el.setAttribute('preserveAspectRatio', 'none')
+  return el
+}
+
+function feDisplacementElement(input: string, map: string, result?: string): SVGFEDisplacementMapElement {
+  const el = document.createElementNS(SVG_NS, 'feDisplacementMap')
+  el.setAttribute('in', input)
+  el.setAttribute('in2', map)
+  el.setAttribute('xChannelSelector', 'R')
+  el.setAttribute('yChannelSelector', 'G')
+  el.setAttribute('scale', '0')
+  if (result) el.setAttribute('result', result)
+  return el
+}
+
+/** Keeps one channel (and the alpha) of its input — the branch splitter of the CA graph. */
+function feChannelElement(input: string, channel: 'r' | 'g' | 'b', result: string): SVGFEColorMatrixElement {
+  const el = document.createElementNS(SVG_NS, 'feColorMatrix')
+  el.setAttribute('in', input)
+  el.setAttribute('type', 'matrix')
+  const row = channel === 'r' ? '1 0 0 0 0' : channel === 'g' ? '0 1 0 0 0' : '0 0 1 0 0'
+  const zero = '0 0 0 0 0'
+  const r = channel === 'r' ? row : zero
+  const g = channel === 'g' ? row : zero
+  const b = channel === 'b' ? row : zero
+  // Alpha passes through: the backdrop behind the glass is opaque, so the re-addition's
+  // alpha clamp at 1 reproduces the source alpha exactly.
+  el.setAttribute('values', `${r}  ${g}  ${b}  0 0 0 1 0`)
+  el.setAttribute('result', result)
+  return el
+}
+
+/** `feComposite arithmetic` with `k2 = k3 = 1` — adds two premultiplied images. */
+function feAddElement(a: string, b: string, result?: string): SVGFECompositeElement {
+  const el = document.createElementNS(SVG_NS, 'feComposite')
+  el.setAttribute('in', a)
+  el.setAttribute('in2', b)
+  el.setAttribute('operator', 'arithmetic')
+  el.setAttribute('k1', '0')
+  el.setAttribute('k2', '1')
+  el.setAttribute('k3', '1')
+  el.setAttribute('k4', '0')
+  if (result) el.setAttribute('result', result)
+  return el
+}
+
 /**
- * One filter per glass surface. The displacement *map* is shared through
- * {@link refractionMapUrl}; only the tiny `<filter>` element is per-surface, which is what
- * lets two thumbs animate to different refraction strengths at the same time.
+ * One filter per glass surface. The displacement *maps* are shared through
+ * {@link refractionMap}; only the tiny `<filter>` element is per-surface, which is what
+ * lets two thumbs animate to different refraction strengths at the same time. Surfaces
+ * without chromatic aberration keep the two-primitive graph; asking for CA rebuilds it as
+ * the eleven-primitive three-branch one.
  */
 export function createGlassFilter(): GlassFilterHandle {
   const id = `lg-refract-${++sequence}`
@@ -243,18 +371,60 @@ export function createGlassFilter(): GlassFilterHandle {
   // The map stores linear displacement amounts, so it must not be colour-managed.
   filter.setAttribute('color-interpolation-filters', 'sRGB')
 
-  const map = document.createElementNS(SVG_NS, 'feImage')
-  map.setAttribute('result', 'map')
-  map.setAttribute('preserveAspectRatio', 'none')
+  let caMode: boolean | null = null
+  let maps: SVGFEImageElement[] = []
+  let displacements: SVGFEDisplacementMapElement[] = []
+  let nodes: Element[] = []
+  /** Per map node: the cache key its `href` was last set from — identical strings are skipped. */
+  let mapKeys: (string | null)[] = []
 
-  const displace = document.createElementNS(SVG_NS, 'feDisplacementMap')
-  displace.setAttribute('in', 'SourceGraphic')
-  displace.setAttribute('in2', 'map')
-  displace.setAttribute('xChannelSelector', 'R')
-  displace.setAttribute('yChannelSelector', 'G')
-  displace.setAttribute('scale', '0')
+  function buildGraph(ca: boolean): void {
+    while (filter.firstChild) filter.removeChild(filter.firstChild)
+    maps = []
+    displacements = []
+    mapKeys = []
+    nodes = []
 
-  filter.append(map, displace)
+    if (!ca) {
+      const map = feImageElement('map')
+      const displace = feDisplacementElement('SourceGraphic', 'map')
+      maps.push(map)
+      displacements.push(displace)
+      mapKeys.push(null)
+      nodes.push(map, displace)
+    } else {
+      const mapR = feImageElement('mapR')
+      const mapG = feImageElement('mapG')
+      const mapB = feImageElement('mapB')
+      const srcR = feChannelElement('SourceGraphic', 'r', 'srcR')
+      const srcG = feChannelElement('SourceGraphic', 'g', 'srcG')
+      const srcB = feChannelElement('SourceGraphic', 'b', 'srcB')
+      const dispR = feDisplacementElement('srcR', 'mapR', 'dispR')
+      const dispG = feDisplacementElement('srcG', 'mapG', 'dispG')
+      const dispB = feDisplacementElement('srcB', 'mapB', 'dispB')
+      const addRG = feAddElement('dispR', 'dispG', 'rg')
+      const addRGB = feAddElement('rg', 'dispB')
+      maps.push(mapR, mapG, mapB)
+      displacements.push(dispR, dispG, dispB)
+      mapKeys.push(null, null, null)
+      nodes.push(mapR, mapG, mapB, srcR, srcG, srcB, dispR, dispG, dispB, addRG, addRGB)
+    }
+    filter.append(...nodes)
+
+    // Primitive subregions must be explicit: the defaults are percentages of the element's
+    // bounding box, which shifts and squeezes the `feImage` maps. `update()` only writes
+    // them when the region size changes, so a mid-session graph rebuild (CA toggling)
+    // would otherwise leave every primitive with the broken defaults.
+    if (lastWidth !== 0) {
+      for (const node of nodes) {
+        node.setAttribute('x', String(-FILTER_PAD))
+        node.setAttribute('y', String(-FILTER_PAD))
+        node.setAttribute('width', String(lastWidth))
+        node.setAttribute('height', String(lastHeight))
+      }
+    }
+  }
+
   svgRoot().appendChild(filter)
 
   let lastMapKey = ''
@@ -264,6 +434,12 @@ export function createGlassFilter(): GlassFilterHandle {
   return {
     id,
     update(spec, amount) {
+      const ca = !!spec.chromaticAberration
+      if (ca !== caMode) {
+        caMode = ca
+        buildGraph(ca)
+      }
+
       const width = Math.round(spec.width + FILTER_PAD * 2)
       const height = Math.round(spec.height + FILTER_PAD * 2)
       if (width !== lastWidth || height !== lastHeight) {
@@ -271,7 +447,7 @@ export function createGlassFilter(): GlassFilterHandle {
         lastHeight = height
         filter.setAttribute('width', String(width))
         filter.setAttribute('height', String(height))
-        for (const node of [map, displace]) {
+        for (const node of nodes) {
           node.setAttribute('x', String(-FILTER_PAD))
           node.setAttribute('y', String(-FILTER_PAD))
           node.setAttribute('width', String(width))
@@ -280,15 +456,29 @@ export function createGlassFilter(): GlassFilterHandle {
         lastMapKey = ''
       }
 
-      const key = mapKey(spec)
+      const key = mapKey(spec, ca ? 1 : 0)
       if (key !== lastMapKey) {
         lastMapKey = key
-        map.setAttribute('href', refractionMapUrl(spec))
+        // Red and blue share the green branch's geometry, so one key guards all three hrefs.
+        const branches: (1 | 0 | -1)[] = ca ? [1, 0, -1] : [0]
+        maps.forEach((map, index) => {
+          const entry = refractionMap(spec, branches[index])
+          if (entry.url && mapKeys[index] !== key) {
+            mapKeys[index] = key
+            map.setAttribute('href', entry.url)
+          }
+        })
       }
 
-      // `feDisplacementMap` offsets by `scale * (channel/255 - 0.5)`, so half the scale is the
-      // largest shift. `refractionAmount` is that largest shift, in px.
-      displace.setAttribute('scale', String(amount * 2))
+      // Set every frame — `amount` is the animation knob and changes independently of the
+      // map geometry. The map encodes magnitudes normalised to `vmax`; the branch's own
+      // scale factor restores them. `feDisplacementMap` offsets by
+      // `scale * (channel/255 - 0.5)`, so `amount * vmax` is that branch's largest shift, px.
+      const branches: (1 | 0 | -1)[] = ca ? [1, 0, -1] : [0]
+      displacements.forEach((displace, index) => {
+        const entry = refractionMap(spec, branches[index])
+        displace.setAttribute('scale', String(amount * 2 * entry.vmax))
+      })
     },
     dispose() {
       filter.remove()

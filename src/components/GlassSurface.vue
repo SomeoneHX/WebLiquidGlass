@@ -233,7 +233,9 @@ function applyLensStyle(): void {
       width,
       height,
       cornerRadii: props.shape.cornerRadii(width, height),
-      refractionHeight: refraction.refractionHeight
+      refractionHeight: refraction.refractionHeight,
+      depthEffect: refraction.depthEffect,
+      chromaticAberration: refraction.chromaticAberration
     },
     refraction.refractionAmount
   )
