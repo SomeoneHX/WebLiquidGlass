@@ -90,14 +90,27 @@ function onDrawSurface(ctx: CanvasRenderingContext2D, size: { width: number; hei
 </template>
 
 <style scoped>
+/*
+ * `Modifier.padding(40f.dp).drawBackdrop(...).fillMaxWidth()` — the 40 dp sits *outside*
+ * the glass box, so the card is the full width minus two 40 px insets, not full-bleed.
+ */
 .dialog__card {
-  width: 100%;
+  width: calc(100% - 80px);
 }
 
-.dialog__body {
+/*
+ * `content-class` lands on a div rendered inside GlassSurface's template, so it carries
+ * GlassSurface's scope attribute, not this view's — the rule must go through `:deep()`
+ * (same pattern as LiquidButton) or it silently never matches and the body collapses into
+ * a flex *row* (the `.glass-surface__content` fallback).
+ */
+.dialog__card :deep(.dialog__body) {
   display: flex;
   flex-direction: column;
-  padding: 40px;
+  /* Compose `Column` defaults to Start on the cross axis; the global
+   * `.glass-surface__content` centres its children, which would centre the title and
+   * shrink the actions row — override it so children fill the width. */
+  align-items: stretch;
   width: 100%;
 }
 

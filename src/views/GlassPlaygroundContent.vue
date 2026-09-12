@@ -290,7 +290,9 @@ function sheetEffects(scope: BackdropEffectScope): void {
   bottom: calc(72px + var(--safe-bottom));
 }
 
-.playground__sheet-body {
+/* `:deep()` — the content div is rendered inside GlassSurface, so a plain scoped rule
+ * would carry this view's scope id and never match (same pitfall as DialogContent). */
+.playground__sheet :deep(.playground__sheet-body) {
   flex-direction: column;
   gap: 16px;
   padding: 24px;
