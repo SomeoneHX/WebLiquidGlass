@@ -18,6 +18,16 @@
  * of each cap, and **0** at the other — where the highlight visibly breaks. Drawing a uniform
  * stroke instead is what put an even white rim around every surface.
  *
+ * Colour is the other half of the difference, and it is why the two variants cannot share a
+ * map:
+ *
+ * - `Default` ends in `color * intensity`, `color` forced opaque, so it is premultiplied white
+ *   all the way round and its `Plus` blend makes the zero half vanish. White on both sides.
+ * - `Ambient` ends in `half4(t, t, t, 1) * intensity`, `t = step(0, d)`. Premultiplied, the
+ *   `d < 0` half is `(0, 0, 0, intensity)` — **black at full intensity**, and with `SrcOver`
+ *   that multiplies the backdrop down. The ring is a bevel: lit side towards the light, shaded
+ *   side away from it.
+ *
  * Chromium cannot run AGSL, but it does not have to approximate here: the field depends only on
  * `(size, corner radii, angle, falloff)`, i.e. it is a static image. It is rasterised once into
  * a canvas and cached, the same trick `glass-filter.ts` uses for the refraction displacement map.
@@ -103,10 +113,10 @@ function build(spec: HighlightMapSpec): HTMLCanvasElement {
       const intensity = Math.min(1, Math.max(0, Math.pow(Math.abs(d), falloff)))
 
       const index = (j * totalWidth + i) * 4
-      // `Default` returns `color * intensity` — white all the way round.
-      // `Ambient` returns `half4(t, t, t, 1) * intensity` with `t = step(0, d)`, i.e. a
-      // premultiplied white on the lit half and premultiplied black on the other. Not wired up
-      // yet — see `paintRing` in `draw-backdrop.ts` for why.
+      // `Default` returns `color * intensity` — white all the way round. `Ambient` returns
+      // `half4(t, t, t, 1) * intensity` with `t = step(0, d)`: premultiplied white on the lit
+      // half, premultiplied black on the other. `putImageData` below is unpremultiplied, which
+      // is the pair of colours the compositor needs after the alpha is applied.
       const lit = variant === 'default' || d >= 0
       const level = lit ? 255 : 0
       data[index] = level

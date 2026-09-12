@@ -181,6 +181,27 @@ function hasRing(highlight: Highlight | null): highlight is Highlight {
  * and it never breaks on the diagonals. The modulated path bakes the field into a cached image
  * (`highlight-map.ts`) and multiplies it into the stroke with `source-in`, which reproduces
  * `color · intensity` with the stroke's own antialiasing and blur left intact.
+ *
+ * `Default` and `Ambient` differ only in *colour*, and that difference is load-bearing:
+ *
+ * - `Default` returns `color · intensity` with `color = style.color.copy(alpha = 1)` — i.e.
+ *   premultiplied **white** everywhere. It rides the `Plus` blend, where the zero half adds
+ *   nothing, so the ring is a glow that fades out around the caps.
+ * - `Ambient` returns `half4(t, t, t, 1) · intensity` with `t = step(0, d)`. AGSL hands back
+ *   **premultiplied** values, so the `d < 0` half is `(0, 0, 0, intensity)` — opaque **black**
+ *   at that alpha, not merely absent. Composed with `DrawScope.DefaultBlendMode` (`SrcOver`,
+ *   `HighlightStyle.kt:73`) the two halves do opposite things:
+ *
+ *     ```
+ *     dst' = src + dst · (1 − intensity)     src = (t·I, t·I, t·I, I)
+ *     d ≥ 0 →  dst + I·(1 − dst)          lerp towards white  — the bevel's lit edge
+ *     d < 0 →  dst · (1 − I)              multiply down        — the bevel's shaded edge
+ *     ```
+ *
+ *   That is a **bevel**, not a rim, which is why `Ambient` — used by exactly the two pressed
+ *   shapes, `LiquidToggle` and `LiquidSlider` — must not go down the additive path. Drawing it
+ *   as a uniform white stroke not only missed the shading, it inverted the effect on half the
+ *   boundary.
  */
 function paintRing(
   ctx: CanvasRenderingContext2D,
@@ -194,16 +215,9 @@ function paintRing(
   const maxWidth = Math.min(highlight.width, Math.min(width, height) / 2)
   const lineWidth = Math.ceil(maxWidth) * 2
 
-  // `createShader()` returned null: a plain, uniform stroke.
-  //
-  // `Ambient` also lands here for now. Its shader returns `half4(t, t, t, 1) · intensity` with
-  // `t = step(0, d)`, and read as premultiplied — which is what AGSL returns — the `d < 0` half
-  // is *black* at that alpha rather than merely absent. Which of the two upstream means can only
-  // be settled against a reference render of a pressed toggle, so the bevel reading stays in
-  // `highlight-map.ts` and the ring keeps its current look until there is something to check it
-  // against. `Default` has no such ambiguity: `Plus` with black is a no-op, so the zero half
-  // simply drops out.
-  if (highlight.style !== 'default') {
+  // `createShader()` returned null: a plain, uniform stroke. This is `Plain`, and also every
+  // style on a device without runtime shaders — the same fallback Android takes.
+  if (highlight.style === 'plain') {
     ctx.save()
     ctx.globalAlpha = highlight.alpha * baseAlpha * highlight.colorAlpha
     if (highlight.blurRadius > 0) ctx.filter = `blur(${highlight.blurRadius}px)`
@@ -237,6 +251,9 @@ function paintRing(
   //    per-pixel `intensity` scales the stroke's coverage. The blur must not be re-applied to
   //    the map — that would smear the field instead of the geometry, which is the opposite of
   //    what `Paint.blur()` does (it is a mask filter: blurred coverage, per-pixel colour).
+  //
+  //    The map carries the *colour* too: white for `Default`, and white-vs-black across `d = 0`
+  //    for `Ambient` — see the doc comment above for why the black half is not a no-op there.
   scratch.filter = 'none'
   scratch.setTransform(1, 0, 0, 1, 0, 0)
   scratch.globalCompositeOperation = 'source-in'
@@ -248,7 +265,7 @@ function paintRing(
       cornerRadii: shape.cornerRadii(width, height),
       angle: highlight.angle,
       falloff: highlight.falloff,
-      variant: 'default'
+      variant: highlight.style
     }),
     0,
     0,
