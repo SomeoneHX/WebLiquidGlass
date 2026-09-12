@@ -154,7 +154,23 @@ export interface Highlight {
   blurRadius: number
   alpha: number
   style: HighlightStyleKind
-  color: string
+  /**
+   * The **style's own colour alpha** — `HighlightStyle.{Plain,Default,Ambient}.color`. All three
+   * are `Color.White.copy(alpha = …)`, so the ring's hue is always white and only this number
+   * varies: 0.38 for `Plain` and `Ambient`, 0.5 for `Default`.
+   *
+   * Distinct from {@link Highlight.alpha}, which is the *layer's* opacity. Upstream calls both
+   * "alpha" and they multiply, so conflating them is the easy mistake — see `Ambient` below.
+   */
+  colorAlpha: number
+  /**
+   * `HighlightStyle.Default.angle` in degrees. Together with {@link Highlight.falloff} it drives
+   * the directional modulation of the ring; see `highlight-map.ts`. `Plain` has no shader
+   * upstream and ignores both.
+   */
+  angle: number
+  /** `HighlightStyle.Default.falloff` — exponent on `|d|`. `ControlCenter` passes `2`. */
+  falloff: number
   /**
    * `BlendMode.Plus` for the styles that declare it; `false` only for `Ambient`, which keeps
    * `DrawScope.DefaultBlendMode` (`HighlightStyle.kt:73`). Where the ring is *drawn* follows
@@ -175,21 +191,28 @@ export const HighlightStyles = {
     blurRadius: 0.25,
     alpha,
     style: 'plain',
-    color: 'rgba(255,255,255,0.38)',
+    colorAlpha: 0.38,
+    angle: 45,
+    falloff: 1,
     additive: true
   }),
-  Default: (alpha = 1, angle = 45, falloff = 1): Highlight => {
-    void angle
-    void falloff
-    return {
-      width: 0.5,
-      blurRadius: 0.25,
-      alpha,
-      style: 'default',
-      color: 'rgba(255,255,255,0.5)',
-      additive: true
-    }
-  },
+  /**
+   * `HighlightStyle.Default` — `White @ 0.5`, `angle = 45°`, `falloff = 1` (`HighlightStyle.kt:47-53`).
+   *
+   * The three arguments are `Highlight.alpha` (layer opacity), the light angle and the falloff
+   * exponent. `angle`/`falloff` are not decoration: they are the uniforms of
+   * `DefaultHighlightShaderString`, and dropping them is what made every ring uniform.
+   */
+  Default: (alpha = 1, angle = 45, falloff = 1): Highlight => ({
+    width: 0.5,
+    blurRadius: 0.25,
+    alpha,
+    style: 'default',
+    colorAlpha: 0.5,
+    angle,
+    falloff,
+    additive: true
+  }),
   /**
    * `Highlight.Ambient.copy(alpha = progress)` — the call sites in `LiquidToggle` / `LiquidSlider`.
    *
@@ -204,7 +227,9 @@ export const HighlightStyles = {
     blurRadius: 0.25,
     alpha,
     style: 'ambient',
-    color: `rgba(255,255,255,${AMBIENT_INTENSITY})`,
+    colorAlpha: AMBIENT_INTENSITY,
+    angle: 45,
+    falloff: 1,
     additive: false
   })
 }

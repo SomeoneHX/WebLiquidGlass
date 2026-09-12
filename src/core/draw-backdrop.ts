@@ -4,6 +4,7 @@ import {
   type LayerTransform,
   type Size
 } from './geometry'
+import { highlightMap } from './highlight-map'
 import type { InteractiveHighlight } from './interactive-highlight'
 import type { Shape } from './shapes'
 
@@ -163,23 +164,104 @@ function hasRing(highlight: Highlight | null): highlight is Highlight {
 /**
  * `HighlightNode.configurePaint` — a stroked outline, blurred, clipped back to the shape so only
  * the inner half of the stroke survives (`canvas.clipOutline` upstream, the shape clip here).
+ *
+ * There are **two** rings upstream, and which one you get is decided by
+ * `HighlightStyle.createShader`:
+ *
+ * - `Plain` returns `null` — and so does every style below API 33 — so
+ *   `paint.setRuntimeShader(null)` leaves an ordinary stroke: uniform white at the style's own
+ *   colour alpha.
+ * - `Default` and `Ambient` return an AGSL shader, and `paint.setRuntimeShader` installs it as
+ *   the paint's shader. Android modulates a shader by the paint colour, so the ring's alpha
+ *   collapses to `styleColorAlpha · |⟨normal, light⟩| ^ falloff` — **directional**, 0.707 along
+ *   the straight edges, up to 1.0 on one diagonal of each cap and 0 on the other.
+ *
+ * The port used to draw the uniform stroke for all three, which is why every surface carried an
+ * even white rim: at the cardinals that is `0.5` against the correct `0.354`, ~1.4× too strong,
+ * and it never breaks on the diagonals. The modulated path bakes the field into a cached image
+ * (`highlight-map.ts`) and multiplies it into the stroke with `source-in`, which reproduces
+ * `color · intensity` with the stroke's own antialiasing and blur left intact.
  */
 function paintRing(
   ctx: CanvasRenderingContext2D,
   shape: Shape,
   width: number,
   height: number,
+  margin: number,
   highlight: Highlight,
   baseAlpha: number
 ): void {
-  ctx.save()
   const maxWidth = Math.min(highlight.width, Math.min(width, height) / 2)
-  ctx.globalAlpha = highlight.alpha * baseAlpha
-  if (highlight.blurRadius > 0) ctx.filter = `blur(${highlight.blurRadius}px)`
-  ctx.strokeStyle = highlight.color
-  ctx.lineWidth = Math.ceil(maxWidth) * 2
-  shape.buildPath(ctx, width, height)
-  ctx.stroke()
+  const lineWidth = Math.ceil(maxWidth) * 2
+
+  // `createShader()` returned null: a plain, uniform stroke.
+  //
+  // `Ambient` also lands here for now. Its shader returns `half4(t, t, t, 1) · intensity` with
+  // `t = step(0, d)`, and read as premultiplied — which is what AGSL returns — the `d < 0` half
+  // is *black* at that alpha rather than merely absent. Which of the two upstream means can only
+  // be settled against a reference render of a pressed toggle, so the bevel reading stays in
+  // `highlight-map.ts` and the ring keeps its current look until there is something to check it
+  // against. `Default` has no such ambiguity: `Plus` with black is a no-op, so the zero half
+  // simply drops out.
+  if (highlight.style !== 'default') {
+    ctx.save()
+    ctx.globalAlpha = highlight.alpha * baseAlpha * highlight.colorAlpha
+    if (highlight.blurRadius > 0) ctx.filter = `blur(${highlight.blurRadius}px)`
+    ctx.strokeStyle = '#fff'
+    ctx.lineWidth = lineWidth
+    shape.buildPath(ctx, width, height)
+    ctx.stroke()
+    ctx.restore()
+    return
+  }
+
+  const totalWidth = width + margin * 2
+  const totalHeight = height + margin * 2
+  const matrix = ctx.getTransform()
+  const dpr = matrix.a || 1
+  const pixelWidth = Math.max(1, Math.round(totalWidth * dpr))
+  const pixelHeight = Math.max(1, Math.round(totalHeight * dpr))
+  const scratch = obtainScratch(pixelWidth, pixelHeight)
+  if (!scratch) return
+
+  // 1) Ring geometry, opaque white — the colour arrives in the next step. Same 2 px stroke
+  //    clipped to its inner half, same BlurMaskFilter equivalent.
+  scratch.setTransform(dpr, 0, 0, dpr, margin * dpr, margin * dpr)
+  scratch.strokeStyle = '#fff'
+  if (highlight.blurRadius > 0) scratch.filter = `blur(${highlight.blurRadius}px)`
+  scratch.lineWidth = lineWidth
+  shape.buildPath(scratch, width, height)
+  scratch.stroke()
+
+  // 2) Modulate. `source-in` keeps the source's colour and multiplies the alphas, so the map's
+  //    per-pixel `intensity` scales the stroke's coverage. The blur must not be re-applied to
+  //    the map — that would smear the field instead of the geometry, which is the opposite of
+  //    what `Paint.blur()` does (it is a mask filter: blurred coverage, per-pixel colour).
+  scratch.filter = 'none'
+  scratch.setTransform(1, 0, 0, 1, 0, 0)
+  scratch.globalCompositeOperation = 'source-in'
+  scratch.drawImage(
+    highlightMap({
+      width,
+      height,
+      margin,
+      cornerRadii: shape.cornerRadii(width, height),
+      angle: highlight.angle,
+      falloff: highlight.falloff,
+      variant: 'default'
+    }),
+    0,
+    0,
+    pixelWidth,
+    pixelHeight
+  )
+
+  // 3) Back into the caller's local space. The scratch spans the whole canvas box, so it is
+  //    drawn from `-margin` and then clipped by whatever clip the caller already set.
+  ctx.save()
+  ctx.globalAlpha = highlight.alpha * baseAlpha * highlight.colorAlpha
+  ctx.translate(-margin, -margin)
+  ctx.drawImage(scratch.canvas, 0, 0, totalWidth, totalHeight)
   ctx.restore()
 }
 
@@ -208,7 +290,7 @@ export function drawGlassOverlay(
   ctx.clip()
 
   if (onDrawSurface) onDrawSurface(ctx, size)
-  if (ring) paintRing(ctx, shape, width, height, ring, layerTransform.alpha)
+  if (ring) paintRing(ctx, shape, width, height, options.margin, ring, layerTransform.alpha)
 
   ctx.restore()
 }
@@ -255,7 +337,7 @@ export function drawGlassAdditive(
   ctx.clip()
 
   if (interactiveHighlight) interactiveHighlight.draw(ctx, width, height)
-  if (ring) paintRing(ctx, shape, width, height, ring, layerTransform.alpha)
+  if (ring) paintRing(ctx, shape, width, height, options.margin, ring, layerTransform.alpha)
 
   ctx.restore()
 }
