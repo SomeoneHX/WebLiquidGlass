@@ -18,16 +18,15 @@ import { useTheme } from '@/composables/backdrop-context'
 /**
  * `ControlCenterContent` — the draggable control-centre sheet.
  *
- * Degraded (API < 31):
- *  - `vibrancy` / `lens` are no-ops, so each tile is the wallpaper behind a 5 % black wash
- *    (`onDrawSurface`) plus its highlight ring;
- *  - the sheet-level `graphicsLayer { renderEffect = BlurEffect(4dp * progress) }` is a
- *    no-op, but the `drawWithContent { drawRect(dimColor * progress) }` around the wallpaper
- *    is **not** — the dim is baked into the captured layer, exactly as in the original.
+ * The sheet-level effects on the wallpaper (`graphicsLayer { renderEffect =
+ * BlurEffect(4dp * progress) }` + `drawWithContent { drawRect(dimColor * progress) }`) both
+ * live *inside* `Modifier.layerBackdrop(backdrop)` upstream, so the recorded backdrop — what
+ * every tile samples — is the blurred and dimmed wallpaper while the tiles stay sharp. The
+ * web port forwards a CSS `filter: blur()` for the wallpaper (its `backdrop-filter` capture
+ * sees the painted, filtered result — same semantics) and paints the dim as before.
  *
- * What survives is the whole point of the port: the vertical drag drives `progress`, which
- * feeds `layerBlock` (translate/scale/alpha), the spacer heights and the dim, so the sheet
- * still springs open and closed.
+ * The vertical drag drives `progress`, which feeds `layerBlock` (translate/scale/alpha), the
+ * spacer heights, the wallpaper blur and the dim, so the sheet still springs open and closed.
  */
 const { isLightTheme } = useTheme()
 
@@ -37,7 +36,6 @@ const itemTwoSpanSize = itemSize * 2 + itemSpacing
 const itemShape: Shape = RoundedRectangle(itemSize / 2)
 
 const innerItemSize = dp(56)
-const innerIconSize = innerItemSize * 0.8
 
 const accentColor = computed(() => (isLightTheme.value ? '#0088FF' : '#0091FF'))
 const containerColor = 'rgba(0, 0, 0, 0.05)'
@@ -76,6 +74,11 @@ const smallSpacerHeight = useFrameValue(() => `${itemSpacing + dp(16) * overshoo
 
 /** `Modifier.drawWithContent { drawContent(); drawRect(dimColor.copy(alpha * progress)) }` */
 const dimColor = computed(() => `rgba(0, 0, 0, ${0.4 * safeProgress.value})`)
+
+/** `graphicsLayer { renderEffect = BlurEffect(4f.dp.toPx() * progress) }` on the wallpaper. */
+const wallpaperFilter = computed(() =>
+  safeProgress.value > 0 ? `blur(${(dp(4) * safeProgress.value).toFixed(2)}px)` : null
+)
 
 function glassLayer(): LayerTransform {
   const p = progress.value
@@ -132,7 +135,7 @@ function onVerticalDragEnd(): void {
 
 /* ------------------------------------------------------------------------- layout ------ */
 const capStyle = { width: `${innerItemSize}px`, height: `${innerItemSize}px` }
-const iconStyle = { width: `${innerIconSize}px`, height: `${innerIconSize}px` }
+const iconStyle = capStyle
 
 const size1 = { width: `${itemSize}px`, height: `${itemSize}px` }
 const size2 = { width: `${itemTwoSpanSize}px`, height: `${itemTwoSpanSize}px` }
@@ -144,6 +147,7 @@ const size1x2 = { width: `${itemSize}px`, height: `${itemTwoSpanSize}px` }
   <BackdropDemoScaffold
     v-slot="{ backdrop }"
     :dim-color="dimColor"
+    :wallpaper-filter="wallpaperFilter"
     :on-vertical-drag="onVerticalDrag"
     :on-vertical-drag-end="onVerticalDragEnd"
   >
@@ -370,7 +374,9 @@ const size1x2 = { width: `${itemSize}px`, height: `${itemTwoSpanSize}px` }
 .cc__column {
   display: flex;
   flex-direction: column;
-  align-items: center;
+  /* Compose `Column` defaults to Start on the cross axis — row 3's single tile lines up
+   * under the *left* tile of the row above (row 2's column is full-width, unaffected). */
+  align-items: flex-start;
 }
 
 .cc__spacer {
@@ -381,13 +387,19 @@ const size1x2 = { width: `${itemSize}px`, height: `${itemTwoSpanSize}px` }
   flex: 0 0 auto;
 }
 
-/* The inner 56 dp capsule sits at the tile's `padding(16.dp)` inset. */
+/*
+ * The inner 56 dp capsule sits at the tile's `padding(16.dp)` inset. `scale(0.8f)` in the
+ * original applies *after* `clip`/`background` — it shrinks the whole capsule (background
+ * + glyph) around its centre while the layout box stays 56 dp, so the visible capsule is
+ * 44.8 dp and the glyph fills it.
+ */
 .cc__cap {
   position: absolute;
   display: flex;
   align-items: center;
   justify-content: center;
   border-radius: 999px;
+  transform: scale(0.8);
 }
 
 .cc__cap--top-start {

@@ -24,6 +24,15 @@ import wallpaperLight from '@/assets/wallpaper_light.webp'
 const props = defineProps<{
   /** Mirrors the `Modifier.drawWithContent { drawContent(); drawRect(dimColor) }` on the wallpaper. */
   dimColor?: string | null
+  /**
+   * Mirrors the `graphicsLayer { renderEffect = BlurEffect(...) }` on the wallpaper
+   * (`ControlCenterContent`) — a CSS `filter` value applied to the wallpaper `<img>`.
+   * In Compose the blur sits *inside* `Modifier.layerBackdrop(backdrop)`, so the recorded
+   * backdrop — what every glass tile samples — is the blurred image while the tiles stay
+   * sharp. `backdrop-filter` reproduces that exactly: it captures the wallpaper's painted
+   * (filtered) result.
+   */
+  wallpaperFilter?: string | null
   hidePicker?: boolean
   /**
    * Port extension for `ControlCenterContent`, where the original puts a
@@ -64,6 +73,10 @@ const dragEnabled = computed(() => typeof props.onVerticalDrag === 'function')
 /** `draggable` owns the pointer, so the scroller must not also pan. */
 const rootStyle = computed(() => (dragEnabled.value ? { touchAction: 'none' } : undefined))
 
+const wallpaperStyle = computed(() =>
+  props.wallpaperFilter ? { filter: props.wallpaperFilter } : undefined
+)
+
 onMounted(() => {
   const node = wrapper.value
   if (!node || !dragEnabled.value) return
@@ -89,7 +102,14 @@ defineExpose({ el: wrapper, backdrop: RootBackdrop, wallpaper: imageEl })
 
 <template>
   <div ref="wrapper" class="scaffold" :style="rootStyle">
-    <img ref="imageEl" class="scaffold__wallpaper" :src="src" alt="" draggable="false" />
+    <img
+      ref="imageEl"
+      class="scaffold__wallpaper"
+      :src="src"
+      :style="wallpaperStyle"
+      alt=""
+      draggable="false"
+    />
     <div v-if="dimColor" class="scaffold__dim" :style="{ background: dimColor }" />
 
     <div class="scaffold__content">
