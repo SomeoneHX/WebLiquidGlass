@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import BackdropDemoScaffold from '@/components/BackdropDemoScaffold.vue'
 import GlassSurface from '@/components/GlassSurface.vue'
 import type { BackdropEffectScope } from '@/core/backdrop'
 import { HighlightStyles } from '@/core/backdrop'
-import { Animatable, OffsetAnimatable, animationRevision, tween } from '@/core/animation'
+import { Animatable, OffsetAnimatable, tween } from '@/core/animation'
 import { dp, type LayerTransform, type Size } from '@/core/geometry'
 import { lerp, sign } from '@/core/math'
 import { RoundedRectangle, type Shape } from '@/core/shapes'
@@ -38,6 +38,15 @@ const { isLightTheme } = useTheme()
 const scaffold = ref<InstanceType<typeof BackdropDemoScaffold> | null>(null)
 const plate = ref<InstanceType<typeof GlassSurface> | null>(null)
 const plateEl = computed(() => (plate.value?.el as HTMLElement | null) ?? null)
+/**
+ * The lens layer is what carries the layer transform (`translate` / `scale` / `rotate`), so
+ * its bounding rect is the plate's *on-screen* quad. The root element never moves — the
+ * drag transform lives on the inner layers — and sampling at the root's rect read the same
+ * wallpaper region forever (the value froze at whatever the centre of the screen is).
+ * Kotlin had no such problem: `layer.record { drawBackdrop() }` recorded inside the draw
+ * pass, at the transformed location by construction.
+ */
+const plateLensEl = computed(() => (plate.value?.lens as HTMLElement | null) ?? null)
 
 /* ------------------------------------------------------------------- animation --------- */
 const luminanceAnimation = new Animatable(isLightTheme.value ? 1 : 0)
@@ -85,16 +94,14 @@ function plateEffects(scope: BackdropEffectScope): void {
 
 /* ---------------------------------------------------------------------- sampling ------- */
 const SAMPLE = 5
-const SAMPLE_INTERVAL = 1000
+const RETRY_DELAY_MS = 250
 let sampleCanvas: HTMLCanvasElement | null = null
-let lastSample = 0
 
-function sampleLuminance(): void {
-  const now = typeof performance !== 'undefined' ? performance.now() : Date.now()
-  if (now - lastSample < SAMPLE_INTERVAL) return
+/** Average luminance of the wallpaper where the plate currently sits, or `null` if either is not ready. */
+function readAverageLuminance(): number | null {
   const image = scaffold.value?.wallpaper ?? null
-  const plateNode = plateEl.value
-  if (!image || !plateNode) return
+  const plateNode = plateLensEl.value ?? plateEl.value
+  if (!image || !plateNode) return null
   const imageRect = image.getBoundingClientRect()
   const rect = plateNode.getBoundingClientRect()
   if (
@@ -105,9 +112,8 @@ function sampleLuminance(): void {
     image.naturalWidth <= 0 ||
     image.naturalHeight <= 0
   ) {
-    return
+    return null
   }
-  lastSample = now
 
   if (!sampleCanvas) {
     sampleCanvas = document.createElement('canvas')
@@ -115,7 +121,7 @@ function sampleLuminance(): void {
     sampleCanvas.height = SAMPLE
   }
   const sctx = sampleCanvas.getContext('2d', { willReadFrequently: true })
-  if (!sctx) return
+  if (!sctx) return null
 
   // `object-fit: cover` — undo the crop to get from element coordinates to source pixels.
   const scale = Math.max(
@@ -134,7 +140,7 @@ function sampleLuminance(): void {
   try {
     sctx.drawImage(image, sx, sy, sw, sh, 0, 0, SAMPLE, SAMPLE)
   } catch {
-    return
+    return null
   }
 
   const data = sctx.getImageData(0, 0, SAMPLE, SAMPLE).data
@@ -143,14 +149,59 @@ function sampleLuminance(): void {
     sum +=
       0.2126 * (data[i] / 255) + 0.7152 * (data[i + 1] / 255) + 0.0722 * (data[i + 2] / 255)
   }
-  const average = sum / (SAMPLE * SAMPLE)
-
-  void luminanceAnimation.animateTo(average, colorSpec)
-  void textMixAnimation.animateTo(average > 0.5 ? 0 : 1, colorSpec)
+  return sum / (SAMPLE * SAMPLE)
 }
 
-/** The original sampled inside `onDrawBackdrop`; `animationRevision` is the equivalent tick. */
-watch(() => animationRevision.value, () => sampleLuminance(), { flush: 'post' })
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * The Kotlin loop is **self-driving**:
+ *
+ * ```
+ * while (isActive) { sample; contentColor.animateTo(tween 1s); luminance.animateTo(tween 1s) }
+ * ```
+ *
+ * it re-samples the moment the 1 s tween settles, from composition to teardown, with no
+ * external trigger. The first port instead sampled from `animationRevision` bumps, which
+ * only exist *while some other animation is running*: at mount nothing ran, so the plate
+ * sat at its initial `luminance = 1` state — `brightness(150%) contrast(0%)`, a flat grey
+ * slab — and the text froze at "1.00" until the first drag happened to kick the loop. Once
+ * running, the settle bumps of the loop's own tweens kept re-arming the 1 s gate, so
+ * sampling never rested either.
+ *
+ * This loop is the faithful port: sample → animate both values for 1 s → repeat. The
+ * retries only cover the wallpaper/plate not being measurable yet.
+ */
+let loopActive = false
+
+async function samplingLoop(): Promise<void> {
+  while (loopActive) {
+    const average = readAverageLuminance()
+    if (average === null) {
+      await delay(RETRY_DELAY_MS)
+      continue
+    }
+    await Promise.all([
+      luminanceAnimation.animateTo(average, colorSpec),
+      textMixAnimation.animateTo(average > 0.5 ? 0 : 1, colorSpec)
+    ])
+  }
+}
+
+onMounted(() => {
+  loopActive = true
+  void samplingLoop()
+})
+
+onBeforeUnmount(() => {
+  loopActive = false
+  // `stop()` resolves the pending `animateTo` promises, so the loop wakes up, sees
+  // `loopActive == false` and exits instead of awaiting forever.
+  luminanceAnimation.stop()
+  textMixAnimation.stop()
+})
 
 /* ----------------------------------------------------------------------- gesture ------- */
 function rotateBy(offset: { x: number; y: number }, angle: number): { x: number; y: number } {
@@ -221,7 +272,8 @@ const highlight = () => HighlightStyles.Plain(1)
   cursor: grab;
 }
 
-.adaptive__content {
+/* `:deep()` — see DialogContent; the content div carries GlassSurface's scope id. */
+.adaptive__plate :deep(.adaptive__content) {
   align-items: center;
   justify-content: center;
 }

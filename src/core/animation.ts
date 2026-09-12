@@ -136,6 +136,18 @@ class TweenSpec implements AnimationSpec {
     private readonly easing: Easing
   ) {}
 
+  /**
+   * Compose specs are immutable value classes, so call sites share one `tween(1000)`
+   * freely between concurrent animations. This class is stateful (`start` / `elapsed`),
+   * so every `animateTo` run needs its own copy — sharing one instance let the second
+   * animation's `reset()` wipe the first's progress and both `step()` calls advance the
+   * same `elapsed` at double speed (and seeded one animation's interpolation start with
+   * the other's value).
+   */
+  clone(): TweenSpec {
+    return new TweenSpec(this.durationMillis, this.easing)
+  }
+
   isAt(value: number, target: number): boolean {
     return Math.abs(value - target) < 1e-4
   }
@@ -152,11 +164,6 @@ class TweenSpec implements AnimationSpec {
 
   private start: number | undefined
   private elapsed = 0
-
-  reset(): void {
-    this.start = undefined
-    this.elapsed = 0
-  }
 }
 
 /* -------------------------------------------------------------------------------------------- */
@@ -274,6 +281,7 @@ export class Animatable {
   private velocity = 0
   private spec: AnimationSpec | null = null
   private unsubscribe: (() => void) | null = null
+  private resolveAnimation: (() => void) | null = null
   /** Called on every value change — mirrors the `block` of `Animatable.animateTo`. */
   onUpdate: ((value: number, velocity: number) => void) | null = null
   /** Arbitrary key so parallel animations on the same value can cancel each other. */
@@ -308,17 +316,24 @@ export class Animatable {
     this.unsubscribe?.()
     this.unsubscribe = null
     this.spec = null
+    // An interrupted run must still release its awaiter: `animateTo` resolves on cancel as
+    // well as on settle. Compose surfaces cancellation through the coroutine scope; a JS
+    // promise has no such channel, and a never-resolving await would deadlock any caller
+    // that sequences animations (the adaptive-luminance sampling loop).
+    this.resolveAnimation?.()
+    this.resolveAnimation = null
   }
 
-  /** `animateTo(target, spec)` — resolves once the animation settles. */
+  /** `animateTo(target, spec)` — resolves once the animation settles or is interrupted. */
   animateTo(target: number, spec: AnimationSpec, initialVelocity?: number): Promise<void> {
     this.stop()
     this._targetValue = target
     if (initialVelocity !== undefined) this.velocity = initialVelocity
-    this.spec = spec
-    if (spec.kind === 'tween') (spec as TweenSpec).reset()
+    // Clone stateful specs per run — see `TweenSpec.clone`.
+    this.spec = spec.kind === 'tween' ? (spec as TweenSpec).clone() : spec
 
     return new Promise<void>((resolve) => {
+      this.resolveAnimation = resolve
       this.unsubscribe = subscribeTick((dt) => {
         const spec = this.spec
         if (!spec) {
@@ -337,7 +352,6 @@ export class Animatable {
         if (settled) {
           this.velocity = 0
           this.stop()
-          resolve()
         }
       })
     })
