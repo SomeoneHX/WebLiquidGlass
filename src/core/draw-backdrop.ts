@@ -1,52 +1,63 @@
+import type { Highlight, Shadow } from './backdrop'
 import {
-  BackdropEffectScope,
-  type Backdrop,
-  type BackdropDrawContext,
-  type Highlight,
-  type InnerShadow,
-  type Shadow
-} from './backdrop'
-import { frameCounter } from './animation'
-import {
-  applyLayerTransform,
   identityTransform,
   type LayerTransform,
-  type Rect,
   type Size
 } from './geometry'
 import type { InteractiveHighlight } from './interactive-highlight'
 import type { Shape } from './shapes'
 
-export interface DrawBackdropOptions {
-  backdrop: Backdrop
+/**
+ * The canvas half of a glass surface.
+ *
+ * ## What moved out of here
+ *
+ * This file used to *paint the backdrop*: it asked a `Backdrop` to draw a recorded bitmap into
+ * the clipped region, then layered the surface wash and the highlight on top. The bitmap is
+ * gone — `backdrop-filter` captures what is behind the element itself, so the glass no longer
+ * holds a copy of the wallpaper anywhere.
+ *
+ * What is left is genuinely decorative and has no CSS equivalent for arbitrary shapes:
+ *
+ * - **shadow** — a blurred silhouette with the shape carved back out, which `filter:
+ *   drop-shadow()` cannot express for a `clip-path` outline
+ * - **surface wash** — `onDrawSurface`, a plain rect over the glass
+ * - **highlight** — a sub-pixel inner stroke, blurred
+ * - **interactive highlight** — the press sheen
+ *
+ * They are split into **three** passes because two things sit between them: the backdrop layer
+ * has to be underneath the lot, and the additive decorations have to be composited by CSS
+ * rather than by the canvas (see {@link drawGlassAdditive}). In the Compose original the whole
+ * thing was one `drawBackdrop` modifier chain; here the backdrop is a DOM layer, so it takes a
+ * canvas on either side of the lens plus one more for the additive half.
+ */
+export interface GlassDecorOptions {
   shape: Shape
   size: Size
-  /**
-   * Viewport rect the element's local (0,0) maps to. Position-only translations applied by
-   * an outer `graphicsLayer` are already folded in here, which is what keeps a dragged
-   * surface sampling the backdrop region it actually covers.
-   */
-  elementRect: Rect
-  /** Full transform applied to the drawn output (shape, content, shadow, highlight). */
+  /** The canvas box is the element box grown by this much on every side. */
+  margin: number
   layerTransform?: LayerTransform
-  /**
-   * Subset of `layerTransform` whose inverse the backdrop applies (`layerBlock`).
-   * Defaults to `layerTransform`.
-   */
-  backdropLayerTransform?: LayerTransform
-  density?: number
-  /** `effects { ... }` block — evaluated for parity, a no-op in the degraded build. */
-  effects?: (scope: BackdropEffectScope) => void
-  highlight?: Highlight | null
+}
+
+export interface GlassShadowOptions extends GlassDecorOptions {
   shadow?: Shadow | null
-  /** Accepted for API parity; never drawn (see `InnerShadowNode`'s supported check). */
-  innerShadow?: InnerShadow | null
-  onDrawBackdrop?: (
-    ctx: CanvasRenderingContext2D,
-    drawBackdrop: () => void,
-    dc: BackdropDrawContext
-  ) => void
+}
+
+/**
+ * Normal-alpha pass: `onDrawSurface` plus the rings that stay `SrcOver`.
+ *
+ * `HighlightStyle.Ambient` is the only ring carried here — it declares
+ * `blendMode = DrawScope.DefaultBlendMode` (`HighlightStyle.kt:73`), unlike `Plain` and
+ * `Default`, which are `BlendMode.Plus` and therefore belong to {@link drawGlassAdditive}.
+ */
+export interface GlassOverlayOptions extends GlassDecorOptions {
+  highlight?: Highlight | null
   onDrawSurface?: (ctx: CanvasRenderingContext2D, size: Size) => void
+}
+
+/** Additive pass: everything upstream draws with `BlendMode.Plus`. */
+export interface GlassAdditiveOptions extends GlassDecorOptions {
+  highlight?: Highlight | null
   interactiveHighlight?: InteractiveHighlight | null
 }
 
@@ -80,151 +91,172 @@ function obtainScratch(width: number, height: number): CanvasRenderingContext2D 
 }
 
 /**
- * Renders one glass surface.
+ * Shadow pass — drawn *behind* the backdrop layer, never clipped to the shape (the blur has to
+ * spill outside it).
  *
- * Mirrors the modifier order produced by `Modifier.drawBackdrop(...)`:
- *
- * ```
- * graphicsLayer(layerBlock)                 <- outer: transforms everything below
- *   InnerShadowElement                      <- disabled on API < 31
- *   ShadowElement                           <- drawn first (behind), not clipped
- *   HighlightElement                        <- drawn last (on top), clipped to the outline
- *   DrawBackdropElement                     <- clip to shape, backdrop, surface, content
- * ```
+ * `ctx` is expected to be in element-local coordinates, i.e. the caller has already applied
+ * the DPR scale and translated by `margin`.
  */
-export function drawBackdrop(
+export function drawGlassShadow(
   ctx: CanvasRenderingContext2D,
-  options: DrawBackdropOptions
+  options: GlassShadowOptions
 ): void {
-  const {
-    backdrop,
-    shape,
-    size,
-    elementRect,
-    density = 1,
-    effects,
-    highlight = null,
-    shadow: shadowSpec = null,
-    onDrawBackdrop,
-    onDrawSurface,
-    interactiveHighlight = null
-  } = options
+  const { shape, size, shadow: shadowSpec = null } = options
+  if (!shadowSpec || shadowSpec.alpha <= 0) return
+
   const layerTransform = options.layerTransform ?? identityTransform
   const width = size.width
   const height = size.height
+  const r = shadowSpec.radius
+  const scratchMargin = r * 2
+  const scratch = obtainScratch(
+    width + scratchMargin * 2 + Math.abs(shadowSpec.offsetX),
+    height + scratchMargin * 2 + Math.abs(shadowSpec.offsetY)
+  )
+  if (!scratch) return
+
+  // Blurred silhouette, offset by the shadow offset.
+  scratch.save()
+  scratch.translate(scratchMargin, scratchMargin)
+  scratch.shadowColor = shadowSpec.color
+  // `BlurMaskFilter(radius)` behaves like a Gaussian with sigma ~= radius / 2,
+  // and canvas `shadowBlur` is 2 * sigma.
+  scratch.shadowBlur = r * 2
+  scratch.shadowOffsetX = shadowSpec.offsetX
+  scratch.shadowOffsetY = shadowSpec.offsetY
+  scratch.fillStyle = 'rgba(0, 0, 0, 1)'
+  shape.buildPath(scratch, width, height)
+  scratch.fill()
+  scratch.restore()
+
+  // Carve the original silhouette back out — `ShadowMaskPaint` in the Kotlin source.
+  scratch.save()
+  scratch.translate(scratchMargin, scratchMargin)
+  scratch.globalCompositeOperation = 'destination-out'
+  scratch.shadowBlur = 0
+  scratch.shadowOffsetX = 0
+  scratch.shadowOffsetY = 0
+  scratch.fillStyle = 'rgba(0, 0, 0, 1)'
+  shape.buildPath(scratch, width, height)
+  scratch.fill()
+  scratch.restore()
 
   ctx.save()
-  // NOTE: `options.offset` (the position-only outer `graphicsLayer` translation) is
-  // deliberately *not* applied here. The caller moves the surface itself — both the canvas
-  // box and the content div — by that amount, so this canvas' local origin already *is* the
-  // moved position. Translating again would double it, and since the backing store only
-  // covers the element box, the glass would be drawn outside it and clipped away.
-  // `elementRect` still carries the offset, so backdrop sampling stays correct.
-  const baseAlpha = layerTransform.alpha
-  ctx.globalAlpha = baseAlpha
-
-  // 1. shadow ---------------------------------------------------------------------------
-  if (shadowSpec && shadowSpec.alpha > 0) {
-    drawShadow(ctx, shape, width, height, shadowSpec, layerTransform, baseAlpha)
-  }
-
-  // 2. clipped glass ---------------------------------------------------------------------
-  ctx.save()
-  applyLayerTransform(ctx, layerTransform, width, height)
-  shape.buildPath(ctx, width, height)
-  ctx.clip()
-
-  // 2a. effects — recorded but never applied in degraded mode.
-  if (effects) {
-    const scope = new BackdropEffectScope()
-    scope.size = size
-    scope.reset()
-    effects(scope)
-  }
-
-  // 2b. backdrop ------------------------------------------------------------------------
-  const dc: BackdropDrawContext = {
-    size,
-    elementRect,
-    layerTransform,
-    density,
-    frame: frameCounter.value
-  }
-  const drawBackdropContent = () => backdrop.draw(ctx, dc)
-  if (onDrawBackdrop) onDrawBackdrop(ctx, drawBackdropContent, dc)
-  else drawBackdropContent()
-
-  // 2c. surface -------------------------------------------------------------------------
-  if (onDrawSurface) onDrawSurface(ctx, size)
-
-  // 2d. interactive press highlight -----------------------------------------------------
-  if (interactiveHighlight) interactiveHighlight.draw(ctx, width, height)
-
-  // 3. highlight ring (on top of everything, clipped to the outline) ---------------------
-  if (highlight && highlight.alpha > 0 && highlight.width > 0) {
-    ctx.save()
-    const maxWidth = Math.min(highlight.width, Math.min(width, height) / 2)
-    ctx.globalAlpha = highlight.alpha * baseAlpha
-    ctx.globalCompositeOperation = highlight.additive ? 'lighter' : 'source-over'
-    if (highlight.blurRadius > 0) ctx.filter = `blur(${highlight.blurRadius}px)`
-    ctx.strokeStyle = highlight.color
-    ctx.lineWidth = Math.ceil(maxWidth) * 2
-    shape.buildPath(ctx, width, height)
-    ctx.stroke()
-    ctx.restore()
-  }
-
-  ctx.restore()
+  ctx.globalAlpha = layerTransform.alpha * shadowSpec.alpha
+  // `layerBlock` is *not* applied here. A canvas has hard edges, so deforming its contents
+  // clips anything that travels past the box — the canvas would have to carry a margin as
+  // large as the largest possible drag, on every surface. `GlassSurface` puts the transform on
+  // the canvas *element* instead, exactly like the lens and content layers.
+  //
+  // `ctx` is already in element-local space; the scratch bitmap's origin sits `scratchMargin`
+  // above/left of it.
+  ctx.translate(-scratchMargin, -scratchMargin)
+  if (scratch.canvas) ctx.drawImage(scratch.canvas, 0, 0)
   ctx.restore()
 }
 
-function drawShadow(
+/** `HighlightNode.configurePaint` — a ring the caller actually asked for. */
+function hasRing(highlight: Highlight | null): highlight is Highlight {
+  return !!highlight && highlight.alpha > 0 && highlight.width > 0
+}
+
+/**
+ * `HighlightNode.configurePaint` — a stroked outline, blurred, clipped back to the shape so only
+ * the inner half of the stroke survives (`canvas.clipOutline` upstream, the shape clip here).
+ */
+function paintRing(
   ctx: CanvasRenderingContext2D,
   shape: Shape,
   width: number,
   height: number,
-  shadow: Shadow,
-  layerTransform: LayerTransform,
+  highlight: Highlight,
   baseAlpha: number
 ): void {
-  const r = shadow.radius
-  const margin = r * 2
-  const scratchWidth = width + margin * 2 + Math.abs(shadow.offsetX)
-  const scratchHeight = height + margin * 2 + Math.abs(shadow.offsetY)
-  const offscreen = obtainScratch(scratchWidth, scratchHeight)
-  if (!offscreen) return
+  ctx.save()
+  const maxWidth = Math.min(highlight.width, Math.min(width, height) / 2)
+  ctx.globalAlpha = highlight.alpha * baseAlpha
+  if (highlight.blurRadius > 0) ctx.filter = `blur(${highlight.blurRadius}px)`
+  ctx.strokeStyle = highlight.color
+  ctx.lineWidth = Math.ceil(maxWidth) * 2
+  shape.buildPath(ctx, width, height)
+  ctx.stroke()
+  ctx.restore()
+}
 
-  // Blurred silhouette, offset by the shadow offset.
-  offscreen.save()
-  offscreen.translate(margin, margin)
-  offscreen.shadowColor = shadow.color
-  // `BlurMaskFilter(radius)` behaves like a Gaussian with sigma ~= radius / 2,
-  // and canvas `shadowBlur` is 2 * sigma.
-  offscreen.shadowBlur = r * 2
-  offscreen.shadowOffsetX = shadow.offsetX
-  offscreen.shadowOffsetY = shadow.offsetY
-  offscreen.fillStyle = 'rgba(0, 0, 0, 1)'
-  shape.buildPath(offscreen, width, height)
-  offscreen.fill()
-  offscreen.restore()
-
-  // Carve the original silhouette back out — `ShadowMaskPaint` in the Kotlin source.
-  offscreen.save()
-  offscreen.translate(margin, margin)
-  offscreen.globalCompositeOperation = 'destination-out'
-  offscreen.shadowBlur = 0
-  offscreen.shadowOffsetX = 0
-  offscreen.shadowOffsetY = 0
-  offscreen.fillStyle = 'rgba(0, 0, 0, 1)'
-  shape.buildPath(offscreen, width, height)
-  offscreen.fill()
-  offscreen.restore()
+/**
+ * Overlay pass — the surface wash and the **non-additive** ring, clipped to the shape and drawn
+ * on top of the backdrop layer under ordinary alpha compositing.
+ */
+export function drawGlassOverlay(
+  ctx: CanvasRenderingContext2D,
+  options: GlassOverlayOptions
+): void {
+  const { shape, size, highlight = null, onDrawSurface } = options
+  const layerTransform = options.layerTransform ?? identityTransform
+  const width = size.width
+  const height = size.height
+  const ring = hasRing(highlight) && !highlight.additive ? highlight : null
+  if (!onDrawSurface && !ring) return
 
   ctx.save()
-  ctx.globalAlpha = baseAlpha * shadow.alpha
-  applyLayerTransform(ctx, layerTransform, width, height)
-  ctx.translate(-margin, -margin)
-  if (offscreen.canvas) ctx.drawImage(offscreen.canvas, 0, 0)
+  ctx.globalAlpha = layerTransform.alpha
+  // No `applyLayerTransform` — the shape clip and the surface wash stay in element-local
+  // space, and the whole canvas is deformed by the CSS transform on its element. Transforming
+  // the contents instead would clip the wash at the canvas edge, which is what left a square
+  // wedge of tint behind while the capsule stretched.
+  shape.buildPath(ctx, width, height)
+  ctx.clip()
+
+  if (onDrawSurface) onDrawSurface(ctx, size)
+  if (ring) paintRing(ctx, shape, width, height, ring, layerTransform.alpha)
+
+  ctx.restore()
+}
+
+/**
+ * Additive pass — the press sheen and the `BlendMode.Plus` rings. This canvas is composited by
+ * `mix-blend-mode: plus-lighter` (set in `GlassSurface`), which is the CSS spelling of
+ * `BlendMode.Plus`.
+ *
+ * Why it needs its own layer: `globalCompositeOperation = 'lighter'` only blends against what is
+ * *already inside the bitmap*, and this bitmap starts empty — so on its own it just accumulates
+ * the flat pass and the glow and hands the browser a semi-transparent white layer. The browser
+ * then composites that layer with plain alpha, i.e. a **lerp towards white**:
+ *
+ * ```
+ * normal:       dst + a·(255 − dst)      // a third of the lift once dst is bright
+ * plus-lighter: dst + a·255              // what BlendMode.Plus does
+ * ```
+ *
+ * Measured on a synthetic `rgb(60, 200, 250)` base with white at `a = 0.23`: normal gives
+ * `105, 213, 251`, `plus-lighter` gives `119, 255, 255`, and pure addition predicts
+ * `118.7, 258.7, 308.7`. The gap is the whole bug — on a bright backdrop the lerp throws away
+ * most of the highlight, which is why the port's press sheen read as a washed-out shimmer
+ * instead of the original's blown-out white.
+ *
+ * `lighter` is still set on the context so the two passes add to each other correctly inside the
+ * bitmap; the composite that reaches the screen is the CSS one.
+ */
+export function drawGlassAdditive(
+  ctx: CanvasRenderingContext2D,
+  options: GlassAdditiveOptions
+): void {
+  const { shape, size, highlight = null, interactiveHighlight = null } = options
+  const layerTransform = options.layerTransform ?? identityTransform
+  const width = size.width
+  const height = size.height
+  const ring = hasRing(highlight) && highlight.additive ? highlight : null
+  if (!interactiveHighlight && !ring) return
+
+  ctx.save()
+  ctx.globalAlpha = layerTransform.alpha
+  ctx.globalCompositeOperation = 'lighter'
+  shape.buildPath(ctx, width, height)
+  ctx.clip()
+
+  if (interactiveHighlight) interactiveHighlight.draw(ctx, width, height)
+  if (ring) paintRing(ctx, shape, width, height, ring, layerTransform.alpha)
+
   ctx.restore()
 }
 

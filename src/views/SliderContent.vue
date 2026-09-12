@@ -3,25 +3,20 @@ import { computed, ref } from 'vue'
 
 import BackdropDemoScaffold from '@/components/BackdropDemoScaffold.vue'
 import LiquidSlider from '@/components/LiquidSlider.vue'
-import { CanvasBackdrop } from '@/core/backdrop'
-import { Colors, toCss } from '@/core/color'
 import { useTheme } from '@/composables/backdrop-context'
 
-/** `SliderContent` — a slider over the wallpaper, and one on a solid card. */
+/**
+ * `SliderContent` — a slider over the wallpaper, and one on a solid card.
+ *
+ * Same story as `ToggleContent`: the card's slider used a `rememberCanvasBackdrop` to sample a
+ * flat colour, but the card is already a DOM box with that colour as its background, so the
+ * thumb's `backdrop-filter` samples it directly.
+ */
 const { isLightTheme } = useTheme()
 
 const value = ref(50)
 
-const backgroundColor = computed(() => (isLightTheme.value ? Colors.White : Colors.Black))
 const cardBackground = computed(() => (isLightTheme.value ? '#FFFFFF' : '#121212'))
-
-const cardBackdrop = computed(
-  () =>
-    new CanvasBackdrop((ctx, dc) => {
-      ctx.fillStyle = toCss(backgroundColor.value)
-      ctx.fillRect(0, 0, dc.size.width, dc.size.height)
-    })
-)
 </script>
 
 <template>
@@ -45,7 +40,7 @@ const cardBackdrop = computed(
             :value-range="[0, 100]"
             :visibility-threshold="0.01"
             :is-light-theme="isLightTheme"
-            :backdrop="cardBackdrop"
+            :backdrop="backdrop"
             @change="value = $event"
           />
         </div>

@@ -46,7 +46,7 @@ const sections: { subtitle: string; items: { label: string; destination: Catalog
 </script>
 
 <template>
-  <div class="home scroll-y fill-screen system-bars-padding display-cutout-padding no-select">
+  <div class="home scroll-y fill-screen system-bars-padding display-cutout-padding">
     <div class="home__header">
       <h1 class="home__title">Backdrop Catalog</h1>
       <button class="home__theme" type="button" @click="toggle()">

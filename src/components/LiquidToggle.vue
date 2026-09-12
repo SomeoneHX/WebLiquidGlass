@@ -3,22 +3,27 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import GlassSurface from './GlassSurface.vue'
 import type { Backdrop, BackdropEffectScope, Highlight, Shadow } from '@/core/backdrop'
-import { HighlightStyles, LayerBackdrop, ScaledBackdrop, combinedBackdrop } from '@/core/backdrop'
+import { HighlightStyles } from '@/core/backdrop'
 import { Colors, Palette, lerpColor, toCss, withAlpha } from '@/core/color'
 import { DampedDragAnimation } from '@/core/damped-drag-animation'
 import { coerceIn, lerp } from '@/core/math'
-import { requestRedraw } from '@/core/animation'
 import { dp, type LayerTransform } from '@/core/geometry'
 import { Capsule } from '@/core/shapes'
-import { useElementMetrics } from '@/composables/useElementMetrics'
 
 /**
  * `LiquidToggle` — `app/src/commonMain/.../components/LiquidToggle.kt`
  *
- * Degraded (API < 31): `blur` / `lens` / `innerShadow` vanish. The track keeps its animated
- * colour, the thumb keeps its `scaleX/scaleY` squash plus the velocity skew, and — because
- * the track layer is recorded and re-scaled — the pressed thumb reveals the squashed track
- * colour behind it (`onDrawSurface` fades its white cover to 0 while pressed).
+ * The track is a plain DOM capsule sitting *behind* the thumb, so the thumb's
+ * `backdrop-filter` picks it up for free — there is no recorded track layer any more. The
+ * Kotlin original additionally re-scaled that captured track by 0.75 while pressed; dropping
+ * it costs nothing visually, because the track is a flat colour
+ * (`lerpColor(trackColor, accent, fraction)`) and flat colour is scale-invariant.
+ *
+ * What still carries the deformation: `innerTransform` squashes the thumb through its
+ * `layerBlock` (plus a velocity skew), and because the backdrop is captured by the browser
+ * and inverse-transformed, the track seen through the thumb stays pinned to the screen while
+ * the capsule stretches. `onDrawSurface` fades the white cover to 0 while pressed so the
+ * track shows through.
  *
  * Note the original has no `clickable`: a plain tap is handled by the drag gesture's
  * `onDragStopped` with `didDrag == false`, which flips the state. The gesture lives on the
@@ -32,15 +37,11 @@ const props = defineProps<{
 
 const emit = defineEmits<{ select: [value: boolean] }>()
 
-const rootEl = ref<HTMLElement | null>(null)
 const thumb = ref<InstanceType<typeof GlassSurface> | null>(null)
-const trackEl = ref<HTMLElement | null>(null)
 const thumbEl = computed(() => (thumb.value?.el as HTMLElement | null) ?? null)
 
 const DRAG_WIDTH = dp(20)
 const PADDING = dp(2)
-
-const { size: trackSize, rect: trackRect } = useElementMetrics(trackEl)
 
 const accent = computed(() => (props.isLightTheme ? Palette.greenLight : Palette.greenDark))
 const trackColor = computed(() => (props.isLightTheme ? Palette.trackLight : Palette.trackDark))
@@ -48,8 +49,6 @@ const trackFill = computed(() => toCss(lerpColor(trackColor.value, accent.value,
 
 const fraction = ref(props.selected ? 1 : 0)
 let didDrag = false
-
-const trackBackdrop = new LayerBackdrop()
 
 const animation = new DampedDragAnimation({
   initialValue: fraction.value,
@@ -85,38 +84,7 @@ watch(
   }
 )
 
-const trackCapture = (ctx: CanvasRenderingContext2D, width: number, height: number): void => {
-  ctx.save()
-  Capsule.buildPath(ctx, width, height)
-  ctx.clip()
-  ctx.fillStyle = toCss(lerpColor(trackColor.value, accent.value, fraction.value))
-  ctx.fillRect(0, 0, width, height)
-  ctx.restore()
-}
-
-watch(
-  [trackSize, trackRect],
-  () => {
-    const { width, height } = trackSize.value
-    if (width <= 0 || height <= 0) return
-    trackBackdrop.configure(width, height, trackCapture, true)
-    trackBackdrop.setRect(trackRect.value)
-    // The recorded track just became available — the thumb has to re-sample it.
-    requestRedraw()
-  },
-  { immediate: true, flush: 'post' }
-)
-
-const compositeBackdrop = combinedBackdrop(
-  props.backdrop,
-  new ScaledBackdrop(
-    trackBackdrop,
-    () => lerp(2 / 3, 0.75, animation.pressProgress),
-    () => lerp(0, 0.75, animation.pressProgress)
-  )
-)
-
-/** `layerBlock` — squash + velocity skew (this is the part inverted for the backdrop). */
+/** `layerBlock` — squash + velocity skew, applied to the thumb shape by the browser's capture. */
 function innerTransform(): LayerTransform {
   const velocity = animation.velocity / 50
   const scaleX = animation.scaleX / (1 - coerceIn(velocity * 0.75, -0.2, 0.2))
@@ -124,10 +92,7 @@ function innerTransform(): LayerTransform {
   return { translationX: 0, translationY: 0, scaleX, scaleY, rotationZ: 0, alpha: 1 }
 }
 
-/**
- * Outer `graphicsLayer { translationX = lerp(padding, padding + dragWidth, fraction) }`.
- * It positions the thumb but is *not* inverted for the backdrop.
- */
+/** Outer `graphicsLayer { translationX = lerp(padding, padding + dragWidth, fraction) }`. */
 function thumbOffset(): { x: number; y: number } {
   return { x: lerp(PADDING, PADDING + DRAG_WIDTH, fraction.value), y: 0 }
 }
@@ -165,18 +130,17 @@ onMounted(() => {
 </script>
 
 <template>
-  <div ref="rootEl" class="liquid-toggle">
-    <div ref="trackEl" class="liquid-toggle__track" :style="{ background: trackFill }" />
+  <div class="liquid-toggle">
+    <div class="liquid-toggle__track" :style="{ background: trackFill }" />
     <GlassSurface
       ref="thumb"
       class="liquid-toggle__thumb"
-      :backdrop="compositeBackdrop"
+      :backdrop="backdrop"
       :shape="Capsule"
       :highlight="highlight"
       :shadow="shadow"
       :effects="effects"
       :layer-transform="innerTransform"
-      :backdrop-transform="innerTransform"
       :offset="thumbOffset"
       :on-draw-surface="onDrawSurface"
     />

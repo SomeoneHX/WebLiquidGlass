@@ -13,10 +13,14 @@ import { useTap } from '@/composables/useTap'
 /**
  * `LiquidButton` — `app/src/commonMain/.../components/LiquidButton.kt`
  *
- * Degraded rendering (API < 31): `vibrancy / blur / lens` are all no-ops, and the tint is
- * painted straight onto the surface. What survives is the deformation: dragging inside the
- * button translates and stretches it through `tanh` damping, and the wallpaper seen through
- * the capsule stays pinned to the screen so the squash is clearly readable.
+ * `vibrancy / blur / lens` go through `backdrop-filter` (see `GlassSurface`), so the capsule
+ * genuinely samples and refracts the wallpaper. The tint stays canvas work because upstream
+ * it is too: `onDrawSurface` paints it with `BlendMode.Hue`, a paint effect rather than a
+ * RenderEffect.
+ *
+ * What is specific to this component is the deformation and the press light. Dragging inside
+ * the button translates and stretches it (through `tanh` damping), and the radial highlight
+ * from `InteractiveHighlight` follows the pointer across it.
  */
 const props = withDefaults(
   defineProps<{
@@ -39,8 +43,7 @@ const interactiveHighlight = props.isInteractive ? new InteractiveHighlight() : 
 
 const shape = Capsule
 
-const highlight = (): Highlight | null =>
-  props.isInteractive ? HighlightStyles.Default(1) : HighlightStyles.Default(1)
+const highlight = (): Highlight | null => HighlightStyles.Default(1)
 
 const shadow = (): Shadow | null => DefaultShadow
 

@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import BackdropDemoScaffold from '@/components/BackdropDemoScaffold.vue'
 import GlassSurface from '@/components/GlassSurface.vue'
-import type { Backdrop, BackdropDrawContext, BackdropEffectScope } from '@/core/backdrop'
+import type { BackdropEffectScope } from '@/core/backdrop'
 import { HighlightStyles } from '@/core/backdrop'
-import { Animatable, OffsetAnimatable, tween } from '@/core/animation'
+import { Animatable, OffsetAnimatable, animationRevision, tween } from '@/core/animation'
 import { dp, type LayerTransform, type Size } from '@/core/geometry'
 import { lerp, sign } from '@/core/math'
 import { RoundedRectangle, type Shape } from '@/core/shapes'
@@ -16,28 +16,28 @@ import { useTheme } from '@/composables/backdrop-context'
 /**
  * `AdaptiveLuminanceGlassContent` — the glass whose *content* reacts to what is behind it.
  *
- * Degraded (API < 31) the glass itself is inert: `colorControls`, `blur` and `lens` are all
- * RenderEffect / RuntimeShader work and therefore gone. But the adaptive part is **not** an
- * effect — it is a feedback loop:
+ * The adaptive part is a feedback loop, not a render effect:
  *
  * ```
  * onDrawBackdrop { drawBackdrop(); layer.record { drawBackdrop() } }
  * while (isActive) { averageLuminance(layer.toImageBitmap().scale(5, 5)); animateTo(...) }
  * ```
  *
- * so the label keeps flipping between black and white as the plate is dragged over dark and
- * light parts of the wallpaper. That is ported in full: the sampled backdrop is re-rendered
- * into a 5 x 5 canvas, read back with `getImageData`, and the average Rec. 709 luma drives a
- * 1 s tween — the same cadence as the original, whose `animateTo(tween(1000))` is awaited
- * before the next sample.
+ * so the label flips between black and white as the plate is dragged across the wallpaper.
+ *
+ * The loop is ported in full, but its **source** had to change. Kotlin could rasterise the
+ * captured backdrop into a 5x5 bitmap; there is no captured backdrop here, so the wallpaper
+ * `<img>` itself is sampled at the plate's position instead. Because the wallpaper uses
+ * `object-fit: cover`, the drawn image is larger than its element and centred, so the mapping
+ * from an element point back to source pixels has to undo that crop. This is the only place in
+ * the port that reads background pixels at all, and it reads them to *drive a colour*, never to
+ * paint itself.
  */
 const { isLightTheme } = useTheme()
 
 const scaffold = ref<InstanceType<typeof BackdropDemoScaffold> | null>(null)
 const plate = ref<InstanceType<typeof GlassSurface> | null>(null)
 const plateEl = computed(() => (plate.value?.el as HTMLElement | null) ?? null)
-
-let rootBackdrop: Backdrop | null = null
 
 /* ------------------------------------------------------------------- animation --------- */
 const luminanceAnimation = new Animatable(isLightTheme.value ? 1 : 0)
@@ -89,10 +89,24 @@ const SAMPLE_INTERVAL = 1000
 let sampleCanvas: HTMLCanvasElement | null = null
 let lastSample = 0
 
-function sampleLuminance(dc: BackdropDrawContext): void {
-  if (!rootBackdrop) return
+function sampleLuminance(): void {
   const now = typeof performance !== 'undefined' ? performance.now() : Date.now()
   if (now - lastSample < SAMPLE_INTERVAL) return
+  const image = scaffold.value?.wallpaper ?? null
+  const plateNode = plateEl.value
+  if (!image || !plateNode) return
+  const imageRect = image.getBoundingClientRect()
+  const rect = plateNode.getBoundingClientRect()
+  if (
+    imageRect.width <= 0 ||
+    imageRect.height <= 0 ||
+    rect.width <= 0 ||
+    rect.height <= 0 ||
+    image.naturalWidth <= 0 ||
+    image.naturalHeight <= 0
+  ) {
+    return
+  }
   lastSample = now
 
   if (!sampleCanvas) {
@@ -102,25 +116,32 @@ function sampleLuminance(dc: BackdropDrawContext): void {
   }
   const sctx = sampleCanvas.getContext('2d', { willReadFrequently: true })
   if (!sctx) return
-  const scaleX = SAMPLE / Math.max(1, dc.size.width)
-  const scaleY = SAMPLE / Math.max(1, dc.size.height)
+
+  // `object-fit: cover` — undo the crop to get from element coordinates to source pixels.
+  const scale = Math.max(
+    imageRect.width / image.naturalWidth,
+    imageRect.height / image.naturalHeight
+  )
+  const cropX = (image.naturalWidth * scale - imageRect.width) / 2
+  const cropY = (image.naturalHeight * scale - imageRect.height) / 2
+  const sx = (rect.left - imageRect.left + cropX) / scale
+  const sy = (rect.top - imageRect.top + cropY) / scale
+  const sw = rect.width / scale
+  const sh = rect.height / scale
 
   sctx.setTransform(1, 0, 0, 1, 0, 0)
   sctx.clearRect(0, 0, SAMPLE, SAMPLE)
-  sctx.save()
-  sctx.scale(scaleX, scaleY)
-  // Maps the element's viewport rect onto the 0..5 sample box.
-  sctx.translate(-dc.elementRect.left, -dc.elementRect.top)
-  rootBackdrop.draw(sctx, dc)
-  sctx.restore()
+  try {
+    sctx.drawImage(image, sx, sy, sw, sh, 0, 0, SAMPLE, SAMPLE)
+  } catch {
+    return
+  }
 
   const data = sctx.getImageData(0, 0, SAMPLE, SAMPLE).data
   let sum = 0
   for (let i = 0; i < data.length; i += 4) {
-    const r = data[i] / 255
-    const g = data[i + 1] / 255
-    const b = data[i + 2] / 255
-    sum += 0.2126 * r + 0.7152 * g + 0.0722 * b
+    sum +=
+      0.2126 * (data[i] / 255) + 0.7152 * (data[i + 1] / 255) + 0.0722 * (data[i + 2] / 255)
   }
   const average = sum / (SAMPLE * SAMPLE)
 
@@ -128,15 +149,8 @@ function sampleLuminance(dc: BackdropDrawContext): void {
   void textMixAnimation.animateTo(average > 0.5 ? 0 : 1, colorSpec)
 }
 
-/** `onDrawBackdrop = { drawBackdrop -> drawBackdrop(); layer.record { drawBackdrop() } }` */
-function onDrawBackdrop(
-  _ctx: CanvasRenderingContext2D,
-  draw: () => void,
-  dc: BackdropDrawContext
-): void {
-  draw()
-  sampleLuminance(dc)
-}
+/** The original sampled inside `onDrawBackdrop`; `animationRevision` is the equivalent tick. */
+watch(() => animationRevision.value, () => sampleLuminance(), { flush: 'post' })
 
 /* ----------------------------------------------------------------------- gesture ------- */
 function rotateBy(offset: { x: number; y: number }, angle: number): { x: number; y: number } {
@@ -147,7 +161,6 @@ function rotateBy(offset: { x: number; y: number }, angle: number): { x: number;
 }
 
 onMounted(() => {
-  rootBackdrop = scaffold.value?.backdrop ?? null
   const node = plateEl.value
   if (!node) return
   const detach = inspectTransformGestures(node, ({ pan, zoom, rotate }) => {
@@ -183,7 +196,6 @@ const highlight = () => HighlightStyles.Plain(1)
         :highlight="highlight"
         :effects="plateEffects"
         :layer-transform="plateLayer"
-        :on-draw-backdrop="onDrawBackdrop"
       >
         <span class="adaptive__label" :style="{ color: textColor }">
           luminance:<br />{{ luminanceText }}

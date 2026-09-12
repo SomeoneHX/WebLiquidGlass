@@ -1,26 +1,28 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import LiquidButton from './LiquidButton.vue'
-import { LayerBackdrop } from '@/core/backdrop'
-import { requestRedraw } from '@/core/animation'
+import { RootBackdrop } from '@/core/backdrop'
+import type { Backdrop } from '@/core/backdrop'
 import { inspectDragGestures } from '@/core/drag-gestures'
-import { layoutEpoch, useElementMetrics } from '@/composables/useElementMetrics'
-import { drawCover, useWallpaper } from '@/composables/useWallpaper'
+import { useWallpaper } from '@/composables/useWallpaper'
 import wallpaperLight from '@/assets/wallpaper_light.webp'
 
 /**
  * `BackdropDemoScaffold` — `app/src/androidMain/.../BackdropDemoScaffold.kt`
  *
- * A full-bleed wallpaper with `ContentScale.Crop`, the captured `LayerBackdrop`, the
- * destination content on top, and the "Pick an image" liquid button pinned to the bottom.
+ * A full-bleed wallpaper `<img>` with `object-fit: cover`, the destination content on top, and
+ * the "Pick an image" liquid button pinned to the bottom.
+ *
+ * The Kotlin version wraps the wallpaper in a `Modifier.layerBackdrop(backdrop)` so it can be
+ * recorded into a bitmap that every glass surface samples. None of that exists here: the
+ * wallpaper is ordinary DOM, `backdrop-filter` captures it directly, and `RootBackdrop` is a
+ * bare marker meaning "this surface does sample the page". The `dim` overlay works the same
+ * way — it is simply painted above the image, exactly where the original drew it *before*
+ * recording, so the glass picks it up either way.
  */
 const props = defineProps<{
-  /**
-   * Mirrors the `Modifier.drawWithContent { drawContent(); drawRect(dimColor) }` the
-   * original applies to the wallpaper <em>before</em> the layer is recorded, so the dim
-   * is part of the captured backdrop (see `DialogContent`).
-   */
+  /** Mirrors the `Modifier.drawWithContent { drawContent(); drawRect(dimColor) }` on the wallpaper. */
   dimColor?: string | null
   hidePicker?: boolean
   /**
@@ -34,75 +36,13 @@ const props = defineProps<{
   onVerticalDragEnd?: () => void
 }>()
 
-/** Every destination receives the captured wallpaper layer through the default slot. */
-defineSlots<{ default?: (props: { backdrop: LayerBackdrop }) => unknown }>()
+defineSlots<{ default?: (props: { backdrop: Backdrop }) => unknown }>()
 
-const { image, src, ready, setFromFile } = useWallpaper(wallpaperLight)
-
-const wallpaper = new LayerBackdrop()
+const { src, setFromFile } = useWallpaper(wallpaperLight)
 
 const wrapper = ref<HTMLElement | null>(null)
 const imageEl = ref<HTMLImageElement | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
-
-const imageMetrics = useElementMetrics(imageEl)
-
-const capture = (
-  ctx: CanvasRenderingContext2D,
-  width: number,
-  height: number
-): void => {
-  const bitmap = image.value
-  if (bitmap && ready.value) drawCover(ctx, bitmap, { width, height })
-  if (props.dimColor) {
-    ctx.fillStyle = props.dimColor
-    ctx.fillRect(0, 0, width, height)
-  }
-}
-
-/**
- * The wallpaper only needs re-recording when its *content* changes (resize, dim change, or
- * the image finishing decoding). A pure position change is handled by `setRect`, so a scroll
- * or a per-frame drag does not force a full re-render of the bitmap.
- *
- * The decode case is why `image` is compared by identity: the very first capture runs while
- * the bitmap is still `null`, so it records an empty layer, and without a re-capture on
- * decode the wallpaper layer stays blank *forever* — every glass surface then samples
- * nothing. `ready` alone is not enough either, because picking a replacement image swaps
- * `image` while `ready` stays `true`.
- */
-let lastWidth = 0
-let lastHeight = 0
-let lastDim: string | null = null
-let lastImage: HTMLImageElement | null = null
-let everConfigured = false
-
-watch(
-  [imageMetrics.size, imageMetrics.rect, image, ready, layoutEpoch, () => props.dimColor],
-  () => {
-    const { width, height } = imageMetrics.size.value
-    if (width <= 0 || height <= 0) return
-    const dim = props.dimColor ?? null
-    const decoded = image.value
-    const contentChanged =
-      !everConfigured ||
-      width !== lastWidth ||
-      height !== lastHeight ||
-      dim !== lastDim ||
-      decoded !== lastImage
-    lastWidth = width
-    lastHeight = height
-    lastDim = dim
-    lastImage = decoded
-    everConfigured = true
-    wallpaper.configure(width, height, capture)
-    wallpaper.setRect(imageMetrics.rect.value)
-    if (contentChanged) wallpaper.invalidate()
-    // The recorded layer changed — force every glass surface to re-sample it.
-    requestRedraw()
-  },
-  { immediate: true, flush: 'post' }
-)
 
 function pickImage() {
   fileInput.value?.click()
@@ -139,11 +79,12 @@ onMounted(() => {
   onBeforeUnmount(detach)
 })
 
-onBeforeUnmount(() => {
-  wallpaper.setRect(null)
-})
-
-defineExpose({ el: wrapper, backdrop: wallpaper })
+/**
+ * `wallpaper` is exposed for `AdaptiveLuminanceGlassContent`, which samples the wallpaper's
+ * pixels directly to derive the plate's luminance — the one destination that genuinely needs to
+ * read the background, and the only surviving consumer of a "backdrop bitmap" in any form.
+ */
+defineExpose({ el: wrapper, backdrop: RootBackdrop, wallpaper: imageEl })
 </script>
 
 <template>
@@ -152,14 +93,14 @@ defineExpose({ el: wrapper, backdrop: wallpaper })
     <div v-if="dimColor" class="scaffold__dim" :style="{ background: dimColor }" />
 
     <div class="scaffold__content">
-      <slot :backdrop="wallpaper" />
+      <slot :backdrop="RootBackdrop" />
     </div>
 
     <LiquidButton
       v-if="!hidePicker"
       class="scaffold__picker"
       :style="pickerStyle"
-      :backdrop="wallpaper"
+      :backdrop="RootBackdrop"
       tint="#0088FF"
       @click="pickImage"
     >

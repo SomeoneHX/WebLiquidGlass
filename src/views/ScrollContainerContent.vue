@@ -8,10 +8,10 @@ import { RoundedRectangle, type Shape } from '@/core/shapes'
 /**
  * `ScrollContainerContent` — 20 rounded glass boxes inside a plain `verticalScroll`.
  *
- * Degraded (API < 31): `vibrancy` and `lens` are no-ops, so each row is the wallpaper seen
- * through a 32 dp rounded rectangle plus its highlight ring. Scrolling still works — and it
- * is the scrolling itself that exercises the port's `LayerBackdrop` re-projection, because
- * every row has to re-sample the (screen-fixed) wallpaper at its new position.
+ * Each row is the wallpaper seen through a 32 dp rounded rectangle plus its highlight ring.
+ * `vibrancy()` / `blur()` / `lens()` all end up in `backdrop-filter`, so the rows are real
+ * glass (`core/glass-filter.ts`). Scrolling keeps working, and the wallpaper stays pinned to
+ * the screen while the rows travel over it — that re-sampling is now the browser's job.
  */
 const COUNT = 20
 

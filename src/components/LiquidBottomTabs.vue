@@ -3,9 +3,9 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import GlassSurface from './GlassSurface.vue'
 import type { Backdrop, BackdropEffectScope, Highlight, Shadow } from '@/core/backdrop'
-import { HighlightStyles, LayerBackdrop, combinedBackdrop } from '@/core/backdrop'
+import { HighlightStyles } from '@/core/backdrop'
 import { Colors, Palette, toCss, withAlpha } from '@/core/color'
-import { Animatable, animationRevision, requestRedraw, spring } from '@/core/animation'
+import { Animatable, spring } from '@/core/animation'
 import { DampedDragAnimation } from '@/core/damped-drag-animation'
 import { EaseOut, coerceIn, lerp, sign } from '@/core/math'
 import { dp, type LayerTransform } from '@/core/geometry'
@@ -17,13 +17,16 @@ import { useFrameValue } from '@/composables/useFrameValue'
 /**
  * `LiquidBottomTabs` — `app/src/commonMain/.../components/LiquidBottomTabs.kt`
  *
- * Three stacked layers, all reproduced here:
- *  1. the visible container (64 dp, `containerColor` surface) whose children are the tabs;
- *  2. a hidden, accent-tinted copy of the same row that is recorded into `tabsBackdrop`.
- *     On API < 31 the wallpaper inside it is opaque, so after `ColorFilter.tint(accent)`
- *     the recorded layer is simply a solid accent capsule;
- *  3. the moving indicator, which samples `combinedBackdrop(root, tabsBackdrop)` and
- *     squashes/stretches while being dragged.
+ * Two glass surfaces:
+ *  1. the container — a 64 dp capsule, its `onDrawSurface` washing it 40 % white/black, with
+ *     the tab row as its content;
+ *  2. the indicator — a sibling of the container (never a child: `backdrop-filter` makes an
+ *     element a backdrop root, so a nested indicator would stop seeing the wallpaper). Being a
+ *     sibling means it captures wallpaper *and* container for free.
+ *
+ * The Kotlin build kept a third, hidden accent-tinted row and recorded it into `tabsBackdrop`
+ * so the indicator could sample solid accent. That recorded layer is gone; the same picture is
+ * painted directly onto the indicator's surface instead.
  */
 const props = defineProps<{
   selectedIndex: number
@@ -35,7 +38,6 @@ const props = defineProps<{
 const emit = defineEmits<{ select: [index: number] }>()
 
 const rootEl = ref<HTMLElement | null>(null)
-const container = ref<InstanceType<typeof GlassSurface> | null>(null)
 const indicator = ref<InstanceType<typeof GlassSurface> | null>(null)
 const indicatorEl = computed(() => (indicator.value?.el as HTMLElement | null) ?? null)
 
@@ -48,8 +50,6 @@ const containerColor = computed(() =>
 
 const tabWidth = computed(() => (rootSize.value.width - dp(8)) / props.tabsCount)
 const maxWidth = computed(() => Math.max(1, rootSize.value.width))
-
-const tabsBackdrop = new LayerBackdrop()
 
 const panelOffsetAnimation = new Animatable(0)
 const panelOffset = useFrameValue(() => {
@@ -94,40 +94,6 @@ watch(currentIndex, (index) => {
   emit('select', index)
 })
 
-/** The captured accent capsule (`tabsBackdrop`) — the hidden tinted row's box. */
-const tintedCapture = (ctx: CanvasRenderingContext2D, width: number, height: number): void => {
-  ctx.save()
-  Capsule.buildPath(ctx, width, height)
-  ctx.clip()
-  ctx.fillStyle = toCss(accent.value)
-  ctx.fillRect(0, 0, width, height)
-  ctx.restore()
-}
-
-watch(
-  [rootSize, panelOffset, () => props.isLightTheme],
-  () => {
-    const width = rootSize.value.width
-    const rect = rootEl.value?.getBoundingClientRect()
-    if (width <= 0 || !rect) return
-    tabsBackdrop.configure(width, dp(56), tintedCapture, false)
-    // The hidden row carries its own `graphicsLayer { translationX = panelOffset }`,
-    // so the recorded layer moves with the panel.
-    tabsBackdrop.setRect({
-      left: rect.left + panelOffset.value,
-      top: rect.top + dp(4),
-      width,
-      height: dp(56)
-    })
-    tabsBackdrop.invalidate()
-    // The recorded accent capsule moved/changed — the indicator has to re-sample it.
-    requestRedraw()
-  },
-  { immediate: true, flush: 'post' }
-)
-
-const combined = combinedBackdrop(props.backdrop, tabsBackdrop)
-
 const interactiveHighlight = new InteractiveHighlight({
   position: (size) => ({
     x: (animation.value + 0.5) * tabWidth.value + panelOffset.value,
@@ -145,8 +111,7 @@ function innerTransform(): LayerTransform {
 
 /**
  * Container: `graphicsLayer { translationX = panelOffset }` **then** `drawBackdrop` with a
- * press-driven scale. The translation sits outside the modifier, so it is a position-only
- * offset (`offset` prop) while the scale is the `layerBlock` (`layerTransform`).
+ * press-driven scale. The translation is a position-only offset; the scale is the `layerBlock`.
  */
 function containerTransform(): LayerTransform {
   const width = Math.max(1, rootSize.value.width)
@@ -209,6 +174,9 @@ function onIndicatorSurface(
   size: { width: number; height: number }
 ) {
   const progress = animation.pressProgress
+  // Stands in for the recorded accent row the Kotlin indicator sampled (`tabsBackdrop`).
+  ctx.fillStyle = toCss(accent.value)
+  ctx.fillRect(0, 0, size.width, size.height)
   ctx.save()
   ctx.globalAlpha = 1 - progress
   ctx.fillStyle = props.isLightTheme ? 'rgba(0, 0, 0, 0.1)' : 'rgba(255, 255, 255, 0.1)'
@@ -230,14 +198,11 @@ onMounted(() => {
     })
   }
 })
-
-void animationRevision
 </script>
 
 <template>
   <div ref="rootEl" class="liquid-bottom-tabs">
     <GlassSurface
-      ref="container"
       class="liquid-bottom-tabs__container"
       content-class="liquid-bottom-tabs__row"
       :backdrop="backdrop"
@@ -246,7 +211,6 @@ void animationRevision
       :shadow="containerShadow"
       :effects="containerEffects"
       :layer-transform="containerTransform"
-      :backdrop-transform="containerTransform"
       :offset="containerOffset"
       :on-draw-surface="onContainerSurface"
       :interactive-highlight="interactiveHighlight"
@@ -258,13 +222,12 @@ void animationRevision
       ref="indicator"
       class="liquid-bottom-tabs__indicator"
       :style="{ left: `${dp(4)}px`, width: `${tabWidth}px` }"
-      :backdrop="combined"
+      :backdrop="backdrop"
       :shape="Capsule"
       :highlight="indicatorHighlight"
       :shadow="indicatorShadow"
       :effects="indicatorEffects"
       :layer-transform="innerTransform"
-      :backdrop-transform="innerTransform"
       :offset="indicatorOffset"
       :on-draw-surface="onIndicatorSurface"
     />

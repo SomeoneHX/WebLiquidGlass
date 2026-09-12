@@ -52,6 +52,29 @@ body {
   background: var(--app-bg);
   color: var(--app-fg);
   overflow: hidden;
+  /*
+   * Compose has no selectable text unless it is explicitly wrapped in a
+   * `SelectionContainer`, and none of the catalog screens do that — so nothing here may be
+   * selected either. Without this the browser's default drag-select wins the pointer stream
+   * on a press-and-move: a button drag paints a selection highlight across its label (and the
+   * magnifier's own text drags the page instead of the lens). Both properties inherit, which
+   * is why this lives on the shell rather than on each glass component.
+   * `-webkit-tap-highlight-color` keeps the same promise on touch: Compose draws its own
+   * ripple, so the platform's grey tap flash is never part of the original's look.
+   */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  /* Long-pressing a label must not raise the iOS selection callout mid-gesture. */
+  -webkit-touch-callout: none;
+}
+
+/* Real editable content keeps normal selection affordances (the catalog has none today). */
+.app-root input,
+.app-root textarea,
+.app-root [contenteditable] {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 /* --- shared glass layout ------------------------------------------------------------- */
@@ -108,10 +131,4 @@ body {
 
 .scroll-y::-webkit-scrollbar {
   display: none;
-}
-
-.no-select {
-  user-select: none;
-  -webkit-user-select: none;
-  -webkit-tap-highlight-color: transparent;
 }

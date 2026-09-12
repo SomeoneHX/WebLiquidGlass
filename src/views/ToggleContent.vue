@@ -3,29 +3,21 @@ import { computed, ref } from 'vue'
 
 import BackdropDemoScaffold from '@/components/BackdropDemoScaffold.vue'
 import LiquidToggle from '@/components/LiquidToggle.vue'
-import { CanvasBackdrop } from '@/core/backdrop'
-import { Colors, toCss } from '@/core/color'
 import { useTheme } from '@/composables/backdrop-context'
 
-/** `ToggleContent` — a toggle over the wallpaper, and one on a solid card. */
+/**
+ * `ToggleContent` — a toggle over the wallpaper, and one on a solid card.
+ *
+ * The Kotlin version gives the card's toggle a `rememberCanvasBackdrop { drawRect(backgroundColor) }`
+ * so it samples a flat colour instead of the wallpaper. Here the card is an ordinary DOM box
+ * with that colour as its CSS background, which the toggle's `backdrop-filter` picks up on its
+ * own — same result, no second backdrop.
+ */
 const { isLightTheme } = useTheme()
 
 const selected = ref(false)
 
-const backgroundColor = computed(() => (isLightTheme.value ? Colors.White : Colors.Black))
 const cardBackground = computed(() => (isLightTheme.value ? '#FFFFFF' : '#121212'))
-
-/**
- * `rememberCanvasBackdrop { drawRect(backgroundColor) }` — a coordinate independent backdrop
- * that simply paints the element's box, so the toggle inside the card samples a flat colour.
- */
-const cardBackdrop = computed(
-  () =>
-    new CanvasBackdrop((ctx, dc) => {
-      ctx.fillStyle = toCss(backgroundColor.value)
-      ctx.fillRect(0, 0, dc.size.width, dc.size.height)
-    })
-)
 </script>
 
 <template>
@@ -44,7 +36,7 @@ const cardBackdrop = computed(
           class="toggle-page__card-toggle"
           :selected="selected"
           :is-light-theme="isLightTheme"
-          :backdrop="cardBackdrop"
+          :backdrop="backdrop"
           @select="selected = $event"
         />
       </div>

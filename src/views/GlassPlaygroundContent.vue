@@ -6,7 +6,7 @@ import GlassSurface from '@/components/GlassSurface.vue'
 import LiquidButton from '@/components/LiquidButton.vue'
 import LiquidSlider from '@/components/LiquidSlider.vue'
 import type { Backdrop, BackdropEffectScope } from '@/core/backdrop'
-import { CanvasBackdrop, HighlightStyles, combinedBackdrop } from '@/core/backdrop'
+import { HighlightStyles } from '@/core/backdrop'
 import { Animatable, OffsetAnimatable, spring } from '@/core/animation'
 import { dp, type LayerTransform, type Size } from '@/core/geometry'
 import { RoundedRectangle, type Shape } from '@/core/shapes'
@@ -108,23 +108,18 @@ onMounted(() => {
 })
 
 /* -------------------------------------------------------------------- sheet export ----- */
-const sheetSurface = new CanvasBackdrop((ctx, dc) => {
-  ctx.save()
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.5)'
-  ctx.fillRect(0, 0, dc.size.width, dc.size.height)
-  ctx.restore()
-})
-
-let cachedRoot: Backdrop | null = null
-let cachedSheetBackdrop: Backdrop | null = null
-
-/** `exportedBackdrop = sheetBackdrop` — the sliders sample the sheet, not the raw wallpaper. */
+/**
+ * `exportedBackdrop = sheetBackdrop` — in Kotlin the sheet exports a composed backdrop (the
+ * wallpaper plus its own 50 % white surface) for the sliders to sample.
+ *
+ * Nothing needs composing here. The sheet's `backdrop-filter` lives on its own lens element,
+ * which is a *sibling* of the sheet's content rather than an ancestor of it — so the sliders
+ * are not inside any backdrop root, and their captures already include the wallpaper, the
+ * sheet's blurred lens and its surface, in paint order. A marker is all that is left to pass
+ * down.
+ */
 function sheetBackdropFor(root: Backdrop): Backdrop {
-  if (cachedRoot !== root || !cachedSheetBackdrop) {
-    cachedRoot = root
-    cachedSheetBackdrop = combinedBackdrop(root, sheetSurface)
-  }
-  return cachedSheetBackdrop
+  return root
 }
 
 /* ------------------------------------------------------------------------- sliders ----- */

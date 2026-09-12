@@ -1,5 +1,5 @@
 import { computed, inject, provide, ref, type ComputedRef, type InjectionKey, type Ref } from 'vue'
-import { LayerBackdrop, type Backdrop } from '@/core/backdrop'
+import type { Backdrop } from '@/core/backdrop'
 
 export const RootBackdropKey: InjectionKey<Backdrop> = Symbol('rootBackdrop')
 
@@ -55,9 +55,4 @@ export function useTheme(): ThemeController {
   const theme = inject(ThemeKey, null)
   if (!theme) throw new Error('Theme was not provided')
   return theme
-}
-
-/** Holds a `LayerBackdrop` plus its pixel size, for the components that export one. */
-export function createLayerBackdrop(): LayerBackdrop {
-  return new LayerBackdrop()
 }

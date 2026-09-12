@@ -3,11 +3,10 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import GlassSurface from './GlassSurface.vue'
 import type { Backdrop, BackdropEffectScope, Highlight, Shadow } from '@/core/backdrop'
-import { HighlightStyles, LayerBackdrop, ScaledBackdrop, combinedBackdrop } from '@/core/backdrop'
+import { HighlightStyles } from '@/core/backdrop'
 import { Colors, Palette, toCss, withAlpha } from '@/core/color'
 import { DampedDragAnimation } from '@/core/damped-drag-animation'
-import { coerceIn, lerp } from '@/core/math'
-import { requestRedraw } from '@/core/animation'
+import { coerceIn } from '@/core/math'
 import { dp, type LayerTransform } from '@/core/geometry'
 import { Capsule } from '@/core/shapes'
 import { useElementMetrics } from '@/composables/useElementMetrics'
@@ -16,9 +15,10 @@ import { useFrameValue } from '@/composables/useFrameValue'
 /**
  * `LiquidSlider` — `app/src/commonMain/.../components/LiquidSlider.kt`
  *
- * Degraded (API < 31): the track fill and the thumb still animate, and the thumb still
- * squashes/stretches with drag velocity; only the blur/refraction/inner-shadow layers are
- * missing.
+ * The track is real DOM (a 6 px capsule plus an accent fill) sitting behind the thumb, so the
+ * thumb's `backdrop-filter` sees both it and the wallpaper. The Kotlin original also recorded
+ * the track into its own layer and re-scaled that copy by up to 1.0 while pressed; that is
+ * gone here and costs nothing, because a flat-coloured track is scale-invariant.
  *
  * Modifier order in the original:
  * ```
@@ -26,11 +26,9 @@ import { useFrameValue } from '@/composables/useFrameValue'
  *   pointerInput { inspectDragGestures }                            // the drag
  *     drawBackdrop(layerBlock = { scaleX/scaleY + velocity skew })   // the deformation
  * ```
- * The `translationX` lives *outside* `drawBackdrop`, so it is a genuine position change:
- * the thumb must end up sampling the wallpaper region it actually covers. That is exactly
- * what the `offset` prop on `GlassSurface` expresses, while the scale stays in
- * `layerTransform` (and is therefore inverted for the backdrop, which is what makes the
- * squash readable — the image behind stays put while the capsule stretches).
+ * That `translationX` is a genuine position change and stays a pure offset; the scale stays in
+ * `layerTransform`. Both end up in one CSS transform, and the browser's own inverse-transform
+ * when capturing the backdrop is what keeps the track pinned while the capsule stretches.
  */
 const props = defineProps<{
   value: number
@@ -47,7 +45,6 @@ const thumb = ref<InstanceType<typeof GlassSurface> | null>(null)
 const trackEl = ref<HTMLElement | null>(null)
 
 const { size: rootSize } = useElementMetrics(rootEl)
-const { size: trackSize, rect: trackRect } = useElementMetrics(trackEl)
 
 const accent = computed(() => (props.isLightTheme ? Palette.blueLight : Palette.blueDark))
 const trackColor = computed(() => (props.isLightTheme ? Palette.trackLight : Palette.trackDark))
@@ -55,8 +52,6 @@ const trackColor = computed(() => (props.isLightTheme ? Palette.trackLight : Pal
 const trackWidth = computed(() => rootSize.value.width)
 
 let didDrag = false
-
-const trackBackdrop = new LayerBackdrop()
 
 function rangeDelta(): number {
   return props.valueRange[1] - props.valueRange[0]
@@ -128,41 +123,6 @@ function thumbOffsetVector(): { x: number; y: number } {
   return { x: thumbOffset.value, y: 0 }
 }
 
-const trackCapture = (ctx: CanvasRenderingContext2D, width: number, height: number): void => {
-  ctx.save()
-  Capsule.buildPath(ctx, width, height)
-  ctx.clip()
-  ctx.fillStyle = toCss(trackColor.value)
-  ctx.fillRect(0, 0, width, height)
-  ctx.restore()
-}
-
-watch(
-  [trackSize, trackRect],
-  () => {
-    const { width, height } = trackSize.value
-    if (width <= 0 || height <= 0) return
-    trackBackdrop.configure(width, height, trackCapture, true)
-    trackBackdrop.setRect(trackRect.value)
-    // The recorded track just became available — the thumb has to re-sample it.
-    requestRedraw()
-  },
-  { immediate: true, flush: 'post' }
-)
-
-/**
- * `rememberCombinedBackdrop(backdrop, rememberBackdrop(trackBackdrop) { scale(...) { drawBackdrop() } })`
- * — the track's own 6 dp fill is part of what the thumb samples, scaled for the press.
- */
-const compositeBackdrop = combinedBackdrop(
-  props.backdrop,
-  new ScaledBackdrop(
-    trackBackdrop,
-    () => lerp(2 / 3, 1, animation.pressProgress),
-    () => lerp(0, 1, animation.pressProgress)
-  )
-)
-
 /** `layerBlock = { scaleX/scaleY + velocity skew }` — the whole deformation. */
 function layerTransform(): LayerTransform {
   const velocity = animation.velocity / 10
@@ -209,6 +169,7 @@ onMounted(() => {
     <div
       ref="trackEl"
       class="liquid-slider__track"
+      :style="{ background: toCss(trackColor) }"
       @pointerdown="onTrackPointerDown"
       @pointerup="onTrackPointerUp"
       @pointercancel="tapStart = null"
@@ -218,7 +179,7 @@ onMounted(() => {
     <GlassSurface
       ref="thumb"
       class="liquid-slider__thumb"
-      :backdrop="compositeBackdrop"
+      :backdrop="backdrop"
       :shape="Capsule"
       :highlight="highlight"
       :shadow="shadow"
@@ -246,7 +207,6 @@ onMounted(() => {
   top: 9px;
   height: 6px;
   border-radius: 999px;
-  background: rgba(120, 120, 120, 0.2);
   overflow: hidden;
   touch-action: none;
 }

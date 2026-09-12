@@ -4,7 +4,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import BackdropDemoScaffold from '@/components/BackdropDemoScaffold.vue'
 import GlassSurface from '@/components/GlassSurface.vue'
 import type { BackdropEffectScope } from '@/core/backdrop'
-import { dp } from '@/core/geometry'
+import { dp, type Size } from '@/core/geometry'
 import { Rectangle } from '@/core/shapes'
 import { inspectDragGestures } from '@/core/drag-gestures'
 import clockSdf from '@/assets/clock_sdf.webp'
@@ -12,10 +12,10 @@ import clockSdf from '@/assets/clock_sdf.webp'
 /**
  * `LockScreenContent` — the draggable SDF clock plate.
  *
- * Degraded (API < 31): `colorControls`, `blur` and the SDF refraction shader are all gone,
- * so the plate is the wallpaper with a 25 % white wash on top. The 2D drag still works, and
- * because the drag is a position-only translation the plate keeps sampling the image region
- * it actually covers.
+ * The 25 % white wash the Kotlin build painted *onto the backdrop* is now an `onDrawSurface`
+ * wash, which lands in the same place in the stack: the backdrop is captured by the browser,
+ * the wash sits on top of it, and the highlight is what comes after. The 2D drag is still a
+ * position-only offset, so the plate samples the region it actually covers.
  */
 const plate = ref<InstanceType<typeof GlassSurface> | null>(null)
 const plateEl = computed(() => (plate.value?.el as HTMLElement | null) ?? null)
@@ -35,10 +35,8 @@ const effects = (scope: BackdropEffectScope): void => {
   scope.sdfTexture(dp(48), 45)
 }
 
-function onDrawBackdrop(ctx: CanvasRenderingContext2D, draw: () => void): void {
-  draw()
-  const size = plate.value?.size
-  if (!size) return
+/** `onDrawBackdrop { drawBackdrop(); drawRect(White.copy(0.25f)) }` */
+function onPlateSurface(ctx: CanvasRenderingContext2D, size: Size): void {
   ctx.fillStyle = 'rgba(255, 255, 255, 0.25)'
   ctx.fillRect(0, 0, size.width, size.height)
 }
@@ -79,7 +77,7 @@ void clockSdf
           :shadow="noShadow"
           :effects="effects"
           :offset="offset"
-          :on-draw-backdrop="onDrawBackdrop"
+          :on-draw-surface="onPlateSurface"
         />
       </div>
       <div class="lock__half" />
