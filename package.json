@@ -3,7 +3,8 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Web port of the AndroidLiquidGlass (kyant/backdrop) Backdrop Catalog demo — degraded mode (Android 12 and below: no blur / no refraction, deformation effects kept).",
+  "description": "Web port of the AndroidLiquidGlass (kyant/backdrop) Web Liquid Glass demo — degraded mode (Android 12 and below: no blur / no refraction, deformation effects kept).",
+  "license": "Apache-2.0",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",

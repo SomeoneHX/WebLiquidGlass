@@ -1,0 +1,12 @@
+Web Liquid Glass
+Copyright 2026 SomeoneHX
+
+This project is a Web port (Vue 3 + TypeScript + Vite) of
+AndroidLiquidGlass — a customizable Liquid Glass effect library
+for Compose Multiplatform.
+
+  Upstream: https://github.com/Kyant0/AndroidLiquidGlass
+  Original work Copyright 2025 Kyant
+  Licensed under the Apache License, Version 2.0
+
+This Web port is distributed under the same Apache License, Version 2.0.
