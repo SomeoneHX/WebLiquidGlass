@@ -16,9 +16,16 @@ import { useFrameValue } from '@/composables/useFrameValue'
  * `LiquidSlider` — `app/src/commonMain/.../components/LiquidSlider.kt`
  *
  * The track is real DOM (a 6 px capsule plus an accent fill) sitting behind the thumb, so the
- * thumb's `backdrop-filter` sees both it and the wallpaper. The Kotlin original also recorded
- * the track into its own layer and re-scaled that copy by up to 1.0 while pressed; that is
- * gone here and costs nothing, because a flat-coloured track is scale-invariant.
+ * thumb's `backdrop-filter` sees both it and the wallpaper.
+ *
+ * ⚠️ **Known gap.** The Kotlin wraps track + fill in `layerBackdrop(trackBackdrop)` and
+ * composites that recorded copy into the thumb's backdrop, scaled `lerp(2/3, 1)` × `lerp(0, 1)`
+ * about the thumb's centre (`LiquidSlider.kt:111`, `:155-165`). Nothing here does, so while the
+ * press spring runs — the glass is meant to show the track pinched in and relaxing — this port
+ * shows the *drawn* track at full size instead. At full press the two coincide (`scale = 1`), so
+ * only the transition differs; `LiquidToggle` is the case where it is visible at rest, because
+ * its track scale settles at **0.75**, not 1. See `LiquidToggle.trackInnerTransform` for the
+ * mechanism (a scaled copy plus a hole in the drawn track) if this ever needs closing.
  *
  * Modifier order in the original:
  * ```
