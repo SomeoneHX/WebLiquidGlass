@@ -149,6 +149,12 @@ export class DampedDragAnimation {
    * a pointerdown outside the gate neither presses nor begins a drag (clicks fall through to
    * the underlying controls) — used when the gesture is attached to a larger element than
    * the dragged visual, e.g. the bottom tabs' bar.
+   *
+   * On touch devices the browser claims any move that touch-action allows for scrolling and
+   * answers with `pointercancel`, killing the drag right after the press (desktop mice are
+   * never cancelled, which is why this only reproduces on mobile). Compose never hits this —
+   * Android's gesture system arbitrates per handler — so the web port must opt the *dragged*
+   * element out of the browser's touch behaviours itself.
    */
   attach(
     element: HTMLElement,
@@ -158,6 +164,7 @@ export class DampedDragAnimation {
     },
     hitTest?: (position: DragPosition) => boolean
   ): () => void {
+    element.style.touchAction = 'none'
     return inspectDragGestures(
       element,
       {

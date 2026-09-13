@@ -145,13 +145,24 @@ export class InteractiveHighlight {
     ctx.restore()
   }
 
-  /** Attaches the pointer tracking. Returns a disposer. `hitTest` gates where a press may start. */
+  /**
+   * Attaches the pointer tracking. Returns a disposer. `hitTest` gates where a press may start.
+   *
+   * The element opts out of browser touch behaviours (`touch-action: none`): the whole point
+   * of this highlight is that the glow and the offset-driven deformation follow a *moving*
+   * pointer, and a browser that claims the gesture for scrolling answers with
+   * `pointercancel` — the press would drop the instant the finger moves (mobile only; mice
+   * are never cancelled). Call sites are press targets (`LiquidButton`) or elements that
+   * already declare this (`LiquidBottomTabs`'s bar), so page scrolling from them is not a
+   * concern.
+   */
   attach(
     element: HTMLElement,
     localPoint: (event: PointerEvent) => DragPosition = (event) =>
       localPointerPosition(element, event.clientX, event.clientY),
     hitTest?: (position: DragPosition) => boolean
   ): () => void {
+    element.style.touchAction = 'none'
     return inspectDragGestures(
       element,
       {
