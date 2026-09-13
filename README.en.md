@@ -152,7 +152,7 @@ WebLiquidGlass/
         ├── ButtonsContent.vue       # LiquidButton + ripple + glass
         ├── ToggleContent.vue        # toggle (thumb scaleY deform + bevel highlight)
         ├── SliderContent.vue        # slider (track + thumb)
-        ├── BottomTabsContent.vue    # bottom tab bar (accent strip composited into capture)
+        ├── BottomTabsContent.vue    # bottom tab bar (glass indicator refracting the bar content)
         ├── DialogContent.vue        # glass dialog
         ├── LockScreenContent.vue    # media-style lock screen
         ├── ControlCenterContent.vue # iOS-style control center (shadow=null, vertical drag)
@@ -240,6 +240,7 @@ Refraction (`url()` inside `backdrop-filter`) is a **Chromium extension**. There
 - High-frequency filter maps are capped by a 32-entry LRU cache (`mapCache`).
 - If a site's CSP restricts `img-src` (no `data:`), the `<feImage>` displacement maps are refused and it fails **completely silently** — see [§10](#10-userscript-liquid-glass-refraction).
 - Headless environments (`--dump-dom`) starve `rAF`, so spring animations emit only a few frames — verify "is the animation running" by checking whether the inline transform changes over time, not by screenshots.
+- **Large-area glass currently has a performance problem**: every glass surface maintains its own filter graph for `backdrop-filter` (SDF → displacement map → `feImage` + `feDisplacementMap`), and capture/composite cost grows linearly with surface size and count. Several large surfaces on screen at once (multiple bottom bars, full-size panels) visibly drop frames on mid/low-end devices; avoid spreading large-area glass in real products for now — see the future-work bullet above (Worker-based map generation, cross-surface sharing).
 - Future: move `glass-filter` map generation into a Worker; add a WebGL refraction fallback for non-Chromium (if WebGL is permitted at that point).
 
 ---
@@ -478,9 +479,8 @@ So "it looks smooth" and "it is arithmetic on a whole-pixel lattice" are both tr
 The following components are **known to contain bugs** in the current build; their glass deformation / capture compositing has **not** been verified pixel-correct against the upstream reference. **Do not use in production or rely on their appearance:**
 
 - **Toggle (`LiquidToggle`)** — the thumb's glass deformation (`innerTransform` squash + velocity skew) and the "press-scaled track layer" punch-through (`trackInnerTransform` + `trackClipPath`) are among the most intricate glass effects in the catalog. The scaled track layer was once dropped under the wrong assumption that "a flat colour is scale-invariant" and has since been rebuilt, but it is **still flagged as buggy**; behaviour may diverge from the original (e.g. wrong track scaling / hole misalignment while pressed).
-- **Bottom Tabs (`LiquidBottomTabs`)** — the indicator capsule composites a hidden accent-row snapshot into its glass capture via `captureOverlay`, and carves an evenodd black-row hole (`blackRowClip`) to keep the black glyphs from showing through. This "capture + clip" chain is fragile, and the **current implementation is flagged as buggy**; you may see misplaced accent content or the black row bleeding through.
 
-> These two components are the priority fix targets.
+> This component is the priority fix target.
 
 ---
 

@@ -152,7 +152,7 @@ WebLiquidGlass/
         ├── ButtonsContent.vue       # LiquidButton + 涟漪 + 玻璃
         ├── ToggleContent.vue        # 开关（thumb scaleY 形变 + bevel 高光）
         ├── SliderContent.vue        # 滑块（轨道 + thumb）
-        ├── BottomTabsContent.vue    # 底部标签栏（accent 条叠加捕获）
+        ├── BottomTabsContent.vue    # 底部标签栏（玻璃指示器透镜折射条内内容）
         ├── DialogContent.vue        # 玻璃对话框
         ├── LockScreenContent.vue    # 媒体风格锁屏
         ├── ControlCenterContent.vue # iOS 风格控制中心（shadow=null，纵向拖拽）
@@ -240,6 +240,7 @@ npm run stage:userscript
 - 部分高频滤镜图有 32 张上限的 LRU 缓存（`mapCache`）。
 - 站点若用 CSP 限制 `img-src`（不允许 `data:`），`<feImage>` 的位移图会被拒绝且**完全静默**——详见 [§10](#10-用户脚本liquid-glass-refraction)。
 - 无头环境（`--dump-dom`）会饿死 `rAF`，弹簧动画只出极少帧——验证动画是否在跑应读 inline transform 是否随时间变化，而非看截图。
+- **大面积玻璃当前存在性能问题**：每个玻璃表面都要为 `backdrop-filter` 维护一份独立的滤镜图（SDF → 位移图 → `feImage` + `feDisplacementMap`），捕获与合成开销随表面尺寸和数量线性增长。同屏多块大面积玻璃（如多个底部横条、全尺寸面板）会在中低端设备上明显掉帧；当前不建议在真实产品里铺大面积玻璃，后续方向见上一条（Worker 化位移图生成、跨表面共享）。
 - 后续可探索：把 `glass-filter` 的位移图生成移到 Worker、对非 Chromium 增加 WebGL 折射 fallback（若届时允许引入 WebGL）。
 
 ---
@@ -478,9 +479,8 @@ amount | scale | neutral bias | predicted | sample offset | content shift | rms
 以下组件在当前构建中**已知存在问题**，其玻璃形变 / 捕获合成尚未达到与原版一致的像素级正确度，**请勿用于生产或依赖其表现**：
 
 - **Toggle（开关，`LiquidToggle`）** —— 拇指玻璃的形变（`innerTransform` 的 squash + 速度倾斜）与"按压缩小轨道层"的挖洞合成（`trackInnerTransform` + `trackClipPath`）是全目录最复杂的玻璃效果之一。该组件的缩放轨道层曾被误判"纯色缩放不变"而整体丢弃，当前虽已重做，但**仍被标记为存在 bug**，表现可能偏离原版（如按压时轨道缩放 / 挖洞错位）。
-- **Bottom Tabs（底部标签栏，`LiquidBottomTabs`）** —— 指示器胶囊通过 `captureOverlay` 把隐藏的 accent 行快照合成进玻璃捕获，并用 evenodd 黑行挖洞（`blackRowClip`）避免黑色字形透出。这套"捕获 + 裁剪"合成链路很脆弱，**当前实现被标记为存在 bug**，可能出现 accent 内容错位或黑行穿帮。
 
-> 这两个组件是后续重点修复对象。
+> 该组件是后续重点修复对象。
 
 ---
 
