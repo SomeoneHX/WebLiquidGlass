@@ -1,17 +1,31 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 
 import BackdropDemoScaffold from '@/components/BackdropDemoScaffold.vue'
 import FlightIcon from '@/components/FlightIcon.vue'
 import LiquidBottomTab from '@/components/LiquidBottomTab.vue'
 import LiquidBottomTabs from '@/components/LiquidBottomTabs.vue'
 import { useTheme } from '@/composables/backdrop-context'
+import { Palette, toCss } from '@/core/color'
 
-/** `BottomTabsContent` — a 3-tab and a 4-tab liquid bottom bar. */
+/** `BottomTabsContent` — a 3-tab and a 4-tab liquid bottom bar (simplified indicator variant). */
 const { isLightTheme } = useTheme()
 
 const threeTabIndex = ref(0)
 const fourTabIndex = ref(0)
+
+const accentColor = computed(() =>
+  toCss(isLightTheme.value ? Palette.blueLight : Palette.blueDark)
+)
+
+/** Selected tab content is tinted accent; unselected stays black/white. */
+function tabColor(index: number, selectedIndex: number): string {
+  return index === selectedIndex
+    ? accentColor.value
+    : isLightTheme.value
+      ? '#000'
+      : '#fff'
+}
 </script>
 
 <template>
@@ -30,9 +44,10 @@ const fourTabIndex = ref(0)
               v-for="index in 3"
               :key="index"
               :selected="threeTabIndex === index - 1"
+              :style="{ color: tabColor(index - 1, threeTabIndex) }"
               @click="threeTabIndex = index - 1"
             >
-              <span class="tabs-page__icon" :style="{ color: isLightTheme ? '#000' : '#fff' }">
+              <span class="tabs-page__icon">
                 <FlightIcon />
               </span>
               <span class="tabs-page__label">Tab {{ index }}</span>
@@ -54,9 +69,10 @@ const fourTabIndex = ref(0)
               v-for="index in 4"
               :key="index"
               :selected="fourTabIndex === index - 1"
+              :style="{ color: tabColor(index - 1, fourTabIndex) }"
               @click="fourTabIndex = index - 1"
             >
-              <span class="tabs-page__icon" :style="{ color: isLightTheme ? '#000' : '#fff' }">
+              <span class="tabs-page__icon">
                 <FlightIcon />
               </span>
               <span class="tabs-page__label">Tab {{ index }}</span>
@@ -88,5 +104,10 @@ const fourTabIndex = ref(0)
 
 .tabs-page__label {
   font-size: 12px;
+}
+
+.tabs-page__icon,
+.tabs-page__label {
+  transition: color 0.2s ease;
 }
 </style>

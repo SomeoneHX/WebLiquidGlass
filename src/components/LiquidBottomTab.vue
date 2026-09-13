@@ -1,8 +1,8 @@
 <script setup lang="ts">
 /**
  * `RowScope.LiquidBottomTab` — a capsule-clipped, weight-1 clickable tab whose content is a
- * centred column with a 2 dp gap. The `LocalLiquidBottomTabScale` CompositionLocal only
- * reaches the hidden tinted copy that feeds `tabsBackdrop`, so the visible tab never scales.
+ * centred column with a 2 dp gap. Content colour (accent when selected) is set by the caller
+ * via inherited `color` — see `BottomTabsContent.vue`.
  */
 defineProps<{ selected?: boolean }>()
 
