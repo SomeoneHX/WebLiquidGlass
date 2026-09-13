@@ -372,6 +372,105 @@ Three reading notes:
 - The table only reflects **root-path response headers**. A `<meta http-equiv="Content-Security-Policy">`, a policy sent only on some subpaths, or one added after an SPA route change will not show up — **the script's own probe is the authority** (it runs on the real page).
 - A hit looks like "frosted glass, no lens" — it neither draws anything wrong nor reports an error. The single deciding question is whether that `data:` PNG can be decoded.
 
+### 10.9 The displacement zero point, and why it stays at 128
+
+`feDisplacementMap` computes `scale × (value/255 − 0.5)`, so the exact zero point is **127.5** — which an 8-bit channel cannot express. Writing 128 leaves a constant **+0.5 LSB = +`scale/510` px** on the whole map, sampling toward (+x, +y); the lens content, background included, reads as shifted up-left. Skia's raster path is literally that expression (`src/effects/imagefilters/SkDisplacementMapImageFilter.cpp`):
+
+```cpp
+const SkVector scaleForColor = SkVector::Make(scale.fX * Inv8bit, scale.fY * Inv8bit);
+const SkVector scaleAdj = SkVector::Make(SK_ScalarHalf - scale.fX * SK_ScalarHalf, ...);
+SkScalar displX = scaleForColor.fX * ex.getX(*displPtr) + scaleAdj.fX;  // = scale × (v/255 − 0.5) + 0.5
+const int srcX = x + SkScalarTruncToInt(displX);                        // truncation, integer fetch
+```
+
+**It never reaches the screen.** Measured with a linear-gradient backdrop, 24 000 px averaged (~0.02 px resolution), on the script in this repo (`scale = 2 × amount`):
+
+| amount | ≤126 | 127 | 128 … 382 | 383 … |
+| --- | --- | --- | --- | --- |
+| Constant term (theory) | ≤0.494 | 0.498 | 0.502 … 1.498 | 1.502 … |
+| Measured shift | **0.000 px** | 0.63 px (knife edge, some pixels only) | **1.01 px** | **2.02 px** |
+
+The staircase strides 255 in `amount` (510 in scale), and screenshots inside one plateau are **byte-identical** (scale 255 and 764 render alike; the jump to 2 px starts at 765) — the result is a **whole-pixel staircase**, not a sub-pixel drift that grows with `amount`. Two independent checks say this chain does not interpolate: a 1 px checkerboard backdrop keeps its contrast at every scale (std 110.42 / p2p 255), and screenshots at integer shifts are byte-identical. Residue of this size cannot survive — but **"it cannot survive" is not the same as "the offset is invisible"**: at `amount ≤ 126` the lens interior is pixel-identical, and once `amount` passes 127 **the whole interior translates by one whole pixel and stays there**. No component in the catalog reaches that, **the playground does** — see §10.11.
+
+**So the "dither the neutral point" fix was not adopted** (checkerboarding 127/128 so the mean lands on 127.5). Measured:
+
+| Configuration | Mean shift | Even / odd pixels |
+| --- | --- | --- |
+| Plain 128 @ scale 255 | +1.00 px | uniform (+1.00 / +1.00) |
+| Dithered 127/128 @ scale 255 | +0.50 px | even **0** / odd **+1.00** — half cancelled only |
+| Dithered 127/128 @ scale 510 | −0.003 px | even **−1.00** / odd **+1.00** — mean zero, paid for with a full-card ±1 px checkerboard |
+
+Dithering therefore trades an invisible whole-pixel offset for per-pixel ±1 px sampling jitter, landing in the **interior** of the lens — the one region that is supposed to be an exact identity, the worst place for noise. Note also that `clampByte` is `Math.round` (round-half-up), so `clampByte(128 + (±0.5))` yields {128, 129}, mean **128.5**: measured, that doubles the offset (1.999 px vs 0.999 px at scale 510). If you ever do dither, the base must be `127.5`.
+
+> A fidelity fact that matters far more than the zero point: Chromium **quantises the displacement to whole pixels and does not interpolate the sample**, whereas the Android original samples at float coordinates — `float2 refractedCoord = coord + d * grad; return content.eval(refractedCoord);` (`RoundedRectRefractionShaderString` in `backdrop/src/commonMain/kotlin/com/kyant/backdrop/internal/Shaders.kt`). The original has neither a zero-point bias nor a quantised field; on the web the rasteriser only moves whole pixels. That is the real fidelity ceiling of this port, and it has nothing to do with the 0.5 LSB term. (§10.10 turns "in this environment" into **"on a real GPU too"**: headless runs through ANGLE Metal on an AMD Radeon RX 570, not a software rasteriser.)
+
+### 10.10 Reproducing the measurement: the lattice is 1 device pixel, the rim cliff is `amount × √(2/bezel)`
+
+Everything above is reproducible with one dependency-free script — CDP over the built-in `WebSocket`, PNG decoded with the built-in `zlib` — which evaluates the core **as committed inside the userscript**, with no second copy of the implementation:
+
+```bash
+node scripts/refraction-probe.mjs map                    # encoder: the 8-bit ladder per catalog spec
+node scripts/refraction-probe.mjs render --dpr=1         # sampler: real Chromium, s(x) from a phase ruler
+node scripts/refraction-probe.mjs render --dpr=2         # the same page at 2x density
+node scripts/refraction-probe.mjs render --bg=checker --blur=1   # pre-displacement blur vs the rim seam
+```
+
+The sampler mode swaps the backdrop for a ruler that rises linearly in device px — `(3x) mod 256`, an exactly integral slope, phase-staggered per row so the sawtooth resets land on a different column on every row and the per-column median discards them — which makes each output column's sample position recoverable. `amount = 32, refractionHeight = 18`:
+
+| dpr | integer offsets walking inward from the rim (device px, one entry per plateau) | plateaus | largest adjacent jump |
+| --- | --- | --- | --- |
+| 1 | 32@0 21@1 17@2 14@3 12@4 10@5 8@6 7@7 5@8 4@9 3@10 2@12 1@13 0@16 | 14 | **11.00 px = 11.00 CSS px** |
+| 2 | 48 59 48 41 37 33 30 28 25 23 21 19 17 16 14 13 11 10 9 8 7 6 5 4 3 2 1 0 | 28 | **11.00 px = 5.50 CSS px** |
+
+Every plateau lands **exactly** on the integer device-pixel lattice (residual 0.000 px; at `amount = 0` the whole map is a zero displacement and matches the lens-free reference pixel for pixel): the sample is rounded to a whole device pixel, not interpolated. **Plateau count scales with `amount × dpr` and each step shrinks accordingly** — the one free improvement a high-density display gives you. The leading three columns at dpr 2 (48 / 59 / 48) are not plateaus: the displacement map itself is a **CSS-pixel**-resolution bitmap, bilinearly upscaled at a non-integer scale, so the cliff is smeared across the outermost two device columns; at dpr 1 the map and the device grid coincide, so the outermost column reads a clean `amount`.
+
+The bezel height is the only geometric knob that shrinks the cliff (`amount = 32`):
+
+| refractionHeight | 6 | 12 | 18 | 24 | 48 |
+| --- | --- | --- | --- | --- | --- |
+| first step (measured) | 18.00 | 13.00 | 11.00 | 9.00 | 7.00 |
+| plateaus (measured) | 7 | 11 | 14 | 17 | 19 |
+| `amount·√(2/bezel)` | 18.5 | 12.8 | 10.5 | 9.1 | 6.5 |
+
+Because `circleMap`'s `1−√(1−t²)` has infinite slope at `t→1`, the outermost column always takes the **whole** `amount` while its neighbour takes only `falloff(−1) = 1−√(2/bezel − 1/bezel²)`; the difference is the cliff. The original AGSL has the same cliff (sampling continuously just draws a line between two samples `amount` apart), so **this is not a web error — it is the design of `Shaders.kt`**, and `refractionHeight` is a 1:1 Kotlin parameter, so changing it is a deliberate divergence.
+
+A `blur` ahead of the displacement is the only lever that lowers visibility without touching the geometry. On a 1-device-px checkerboard at `amount = 14/32`, measuring the first rim column against the last column outside:
+
+| Pre-displacement blur | 0 px | 0.5 px | 1 px | 2 px | 4 px |
+| --- | --- | --- | --- | --- | --- |
+| Rim seam contrast (levels) | 127.5 | 84.8 | 64.0 | 64.0 | 64.0 |
+| Backdrop texture outside the lens (control) | 255.0 | 255.0 | 255.0 | 255.0 | 255.0 |
+
+That control row is the invariant: `blur` only touches the backdrop *behind* the element, so the checkerboard outside the lens keeps full contrast. One pixel therefore captures most of the benefit and it saturates after that — which is the opposite of what three animated components do: `LiquidToggle` / `LiquidSlider` use `blur(dp(8) × (1 − progress))`, so **at full press the blur is zero exactly when the lens is strongest**, the worst cell of the grid.
+
+### 10.11 The whole pixel you can actually see in the playground
+
+§10.9 once claimed "for `amount ≤ 126` the lens interior is pixel-identical — the default 22 *and the entire usable range*". **That holds for the catalog, not for the playground.** `GlassPlaygroundContent` drives `refractionAmountFraction × minDimension` on a `256 × 256` hero card, so `amount` reaches **256** and `scale = 2 × amount` crosses the 255 knife edge at **fraction 0.5**. The offset that "cannot survive" is therefore plain visible there:
+
+```
+$ node scripts/refraction-probe.mjs render --probe=shift --bg=noise \
+    --size=256x256 --radius=128 --lens=300,120 --bezel=25.6 --depth \
+    --amounts=0,120,127,128,255,382,512
+amount | scale | neutral bias | predicted | sample offset | content shift | rms
+     0 |    0.0 |  0.0000 px |   0 px | (  0,   0) | (  0,   0) | 0.00
+   120 |  240.0 |  0.4706 px |   0 px | (  0,   0) | (  0,   0) | 0.00
+   127 |  254.0 |  0.4980 px |   0 px | (  1,   1) | ( -1,  -1) | 0.00
+   128 |  256.0 |  0.5020 px |   1 px | (  1,   1) | ( -1,  -1) | 0.00
+   255 |  510.0 |  1.0000 px |   1 px | (  1,   1) | ( -1,  -1) | 0.00
+   382 |  764.0 |  1.4980 px |   1 px | (  2,   2) | ( -2,  -2) | 0.00
+   512 | 1024.0 |  2.0078 px |   2 px | (  2,   2) | ( -2,  -2) | 0.00
+```
+
+`sample offset` is where each output pixel reads from, so **the content moves to (−1, −1) — up and left**; `rms 0.00` means the lens interior is **byte-identical** to the backdrop translated by one pixel: no blur, no interpolation, a rigid whole-pixel copy. The knife edges land at `amount 127` and `382` (one channel earlier than the ideal 127.5 / 382.5, which is the rasteriser's own rounding — 0.002 LSB). As a picture: at `amount 0` all nine cells are `(0,0) rms 0.0`; at `amount 128` the **four interior cells all flip to `(1,1) rms 0.0`**, and only the edge cells keep a high `rms` of 80–90 — there the displacement field genuinely varies, so a "rigid shift" is meaningless.
+
+So "it looks smooth" and "it is arithmetic on a whole-pixel lattice" are both true: the slider has exactly **three states, 0 → 1 → 2 px**, and **a rigid 1 px step of everything at once has no visible edge** — especially while you are dragging the slider. The impression of a continuously growing pull comes from the rim band (the `rms` 80–90 cells): there the content is pushed outward, growing linearly with `amount`, and on the bottom-right side that reads as being dragged toward the bottom-right corner.
+
+| Fix | Measured outcome | Cost |
+| --- | --- | --- |
+| **Use the B channel as a coverage mask**: encode rim-vs-interior in the unused B, take alpha with `feColorMatrix`, cut the rim out with `feComposite in`, `feComposite over` it back onto `SourceGraphic` | interior pixel-identical at **any** `amount` | 3 extra primitives per surface, inside `glass-filter.ts`'s graph builder |
+| `feOffset` counter-offset (the alternative floated in §10.9) | **Rejected.** At `bias = 1.0000` it does cancel (`rms 0.00`); at `bias = 0.502` it leaves 0.5 px *and* resamples the interior into a 50/50 blend of neighbouring pixels (`rms` **69/255** on a noise backdrop) | trades a 1 px jump for a 0.5 px blur. It does prove something useful, though: **`feOffset` is the only sub-pixel-capable primitive in this chain** |
+| Clamp `refractionAmount` so `2·amount·vmax < 255` | interior constant, one-line change | caps what the playground exists to explore |
+
 ---
 
 ## ⚠️ Known Bugs (current build)

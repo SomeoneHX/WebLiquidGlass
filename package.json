@@ -11,6 +11,8 @@
     "preview": "vite preview",
     "check:userscript": "node --check userscript/liquid-glass-refract.user.js",
     "stage:userscript": "node scripts/stamp-userscript.mjs 0 dist/liquid-glass-refract.user.js",
+    "probe:map": "node scripts/refraction-probe.mjs map",
+    "probe:render": "node scripts/refraction-probe.mjs render",
     "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {

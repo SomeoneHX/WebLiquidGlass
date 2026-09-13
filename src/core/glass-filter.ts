@@ -7,8 +7,9 @@
  * needs a copy of the wallpaper — the browser does the capture. Blur, saturation and
  * brightness map 1:1 onto CSS filter functions. Refraction does not: CSS has no
  * "shift every pixel by a vector field" primitive, so that one effect goes through an SVG
- * filter. `feDisplacementMap` reads a map where R = dx and G = dy (128 = no offset) and
- * shifts each pixel by it.
+ * filter. `feDisplacementMap` reads a map where R = dx and G = dy (128 = no offset — the exact
+ * zero point is 127.5; see the note at the neutral fill in `buildMap`) and shifts each pixel by
+ * it.
  *
  * The map itself is generated on a canvas from the rounded-rect signed distance field —
  * the same construction as the AGSL `RoundedRectRefractionShaderString` the Android build
@@ -236,6 +237,21 @@ function buildMap(spec: RefractionSpec, branch: 1 | 0 | -1): MapEntry {
     for (let i = 0; i < cw; i++) {
       const index = (j * cw + i) * 4
       // Neutral grey = "leave this pixel alone".
+      //
+      // The exact zero point is 127.5, not 128: `feDisplacementMap` reads the channel as
+      // value/255 minus 0.5, so a uniform 128 leaves a constant +0.5 LSB on the whole map
+      // (= +scale/510 px of sampling offset toward +x/+y, which reads as the lens drifting
+      // up-left). It is left uncorrected on purpose.
+      //
+      // Measured against a linear-gradient backdrop (24 000 px averaged, ~0.02 px resolution),
+      // what reaches the screen is a whole-pixel staircase, not a drift that grows with the
+      // amount: 0 px up to scale 252, 1 px from 255 to 764, 2 px from 765 — and screenshots on
+      // one plateau are byte-identical. A 1 px checkerboard backdrop keeps its full contrast at
+      // every scale, so the offset is quantised to whole pixels with nearest-neighbour sampling
+      // (Skia's raster path truncates: `srcX = x + SkScalarTruncToInt(displX)`); residue of this
+      // size cannot survive. Dithering the neutral between 127 and 128 cancels the mean only
+      // above scale 510 and converts an invisible whole-pixel offset into per-pixel ±1 px
+      // sampling jitter — noise inside the region that is supposed to be an exact identity.
       data[index] = 128
       data[index + 1] = 128
       data[index + 2] = 128
@@ -358,6 +374,7 @@ function buildZoomMap(width: number, height: number, zoom: BackdropZoom): MapEnt
     for (let i = 0; i < cw; i++) {
       const x = i - FILTER_PAD
       const index = (j * cw + i) * 4
+      // Neutral grey — same 127.5-vs-128 zero point as `buildMap`, same deliberate choice.
       data[index] = 128
       data[index + 1] = 128
       data[index + 2] = 128
