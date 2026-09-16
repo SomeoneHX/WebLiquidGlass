@@ -1,0 +1,189 @@
+/*
+ * Kit styles for the productized glass controls.
+ *
+ * Imported by `kit/index.ts`, so `import { GlassSwitch } from '…/kit'` brings it along — there is
+ * no second stylesheet to wire up. (Vite emits it as a normal CSS asset; SSR setups should import
+ * `…/kit/glass-controls.css` from their entry instead, since a JS-side import is not extracted
+ * server-side.)
+ *
+ * Two rules here are load-bearing rather than cosmetic:
+ *
+ * 1. `.glass-control__native` is *visually* hidden, never `display: none`. A `display: none` control
+ *    cannot take focus, cannot be reached by an external `<label for>`, and is dropped from the
+ *    accessibility tree — which would defeat the entire point of the kit.
+ * 2. Disabled styling must not use `opacity` or `filter` on any ancestor of the lens. Either
+ *    property makes that element a **backdrop root** (Filter Effects L2 § 3), so the surface would
+ *    stop sampling the page and the "disabled glass" would render as a flat, empty capsule. The
+ *    wash below is therefore a *sibling* painted over the glass, which changes nothing about what
+ *    the lens can see.
+ */
+
+.glass-control {
+  position: relative;
+  display: inline-flex;
+  vertical-align: middle;
+  /* Every control is a capsule in this port; the ring and the disabled wash inherit it. */
+  border-radius: var(--glass-control-radius, 999px);
+}
+
+/* The visible focus ring. Drawn on the glass rather than on the hidden input, and as `outline`
+ * rather than `box-shadow`: the glass layers are clipped to the shape, so an outer shadow would be
+ * painted underneath the canvases and never seen. */
+.glass-control:focus-visible > .glass-control__visual,
+.glass-control__native:focus-visible ~ .glass-control__visual {
+  outline: var(--glass-focus-width, 2px) solid var(--glass-focus-color, #0088ff);
+  outline-offset: var(--glass-focus-offset, 2px);
+}
+
+/* Visually hidden, fully semantic, and the single source of truth for state.
+ * `pointer-events: none` keeps it from stealing the pointer stream from the visual layer, which
+ * owns the drag and press gestures; keyboard, `label[for]` activation and constraint validation are
+ * unaffected because none of them are pointer events. */
+.glass-control__native {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  clip-path: inset(50%);
+  pointer-events: none;
+}
+
+/* Disabled: a sibling wash over the glass (see the header note) plus a cursor hint.
+ * `::after` is generated on the wrapper, i.e. *outside* the surface subtree, so the lens behind it
+ * keeps sampling the real backdrop. */
+.glass-control--disabled {
+  cursor: not-allowed;
+}
+
+.glass-control--disabled::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: var(--glass-disabled-wash, rgba(120, 120, 120, 0.28));
+}
+
+.glass-control--disabled:focus-within,
+.glass-control--disabled:focus-visible {
+  outline: none;
+}
+
+/* The ported controls set their own hit areas (a 40×24 switch thumb, a 40 px slider thumb). A
+ * disabled control must not start a gesture, and neither control offers an "interactive: false"
+ * switch, so the pointer is cut off at the wrapper. */
+.glass-control--disabled .glass-control__visual {
+  pointer-events: none;
+}
+
+/* --- button ---------------------------------------------------------------------------------- */
+
+.glass-button {
+  /* Reset: the button is a semantic shell, all visuals come from `LiquidButton`. */
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: inherit;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  height: var(--glass-button-height, 48px);
+}
+
+.glass-button:disabled {
+  cursor: not-allowed;
+}
+
+/*
+ * The visual fills the shell's box on both axes.
+ *
+ * Height: the shell owns the `--glass-button-height` token, and `LiquidButton` hardcodes 48px in its
+ * own scoped rule — this selector is more specific, so the token wins.
+ * Width: as a flex item the shell stretches to its container (a column flex parent does that by
+ * default) while the ported visual is content-sized, which left the glass narrower than the button.
+ * The visible symptom was a `disabled` wash spanning the full row over a capsule that stopped at the
+ * label, i.e. the clickable box and the drawn glass disagreed.
+ */
+.glass-button > .glass-control__visual {
+  height: 100%;
+  width: 100%;
+}
+
+.glass-button__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.glass-button__spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  animation: glass-control-spin 700ms linear infinite;
+}
+
+@keyframes glass-control-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* --- switch ---------------------------------------------------------------------------------- */
+
+/* Fixed at the ported 64×28: `LiquidToggle` derives its track, clip hole and thumb geometry from
+ * those numbers as literals, so the kit cannot resize it without either editing that component or
+ * scaling it (which rasterises the canvases). Size variants belong upstream. */
+.glass-switch {
+  width: 64px;
+  height: 28px;
+}
+
+/* --- tabs ----------------------------------------------------------------------------------- */
+
+/* The wrapper is the host's layout box (it never carries the glass); the ported bar keeps its own
+ * 64 px height and full width inside it. Deliberately not the `.glass-control` base class: tabs have
+ * no disabled state and no wash, and the ring belongs on the tabs themselves. */
+.glass-tabs {
+  display: block;
+  width: var(--glass-tabs-width, 100%);
+}
+
+/* `outline-offset` is negative so the ring stays inside the bar instead of being clipped by the
+ * container's caps; the tab already has `border-radius: 999px`, so the outline is a capsule. */
+.glass-tabs [role='tab']:focus-visible {
+  outline: var(--glass-focus-width, 2px) solid var(--glass-focus-color, #0088ff);
+  outline-offset: -3px;
+}
+
+/* --- slider ---------------------------------------------------------------------------------- */
+
+.glass-slider {
+  width: var(--glass-slider-width, 100%);
+}
+
+.glass-slider > .glass-control__visual {
+  width: 100%;
+}
+
+/* --- motion preferences ---------------------------------------------------------------------- */
+
+/* The kit's own motion only. The glass springs are inside `core/animation.ts`, shared with the
+ * demo, and are not reachable from here — see `index.ts` for the opt-in that would change that. */
+@media (prefers-reduced-motion: reduce) {
+  .glass-button__spinner {
+    animation: none;
+  }
+
+  .glass-control > .glass-control__visual,
+  .glass-control__native ~ .glass-control__visual {
+    transition: none;
+  }
+}
