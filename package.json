@@ -14,6 +14,7 @@
     "probe:map": "node scripts/refraction-probe.mjs map",
     "probe:render": "node scripts/refraction-probe.mjs render",
     "probe:band": "node scripts/refraction-probe.mjs band",
+    "probe:perf": "node scripts/refraction-probe.mjs perf",
     "probe:fidelity": "node scripts/refraction-probe.mjs fidelity",
     "typecheck": "vue-tsc --noEmit"
   },

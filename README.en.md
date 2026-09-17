@@ -243,10 +243,10 @@ Refraction (`url()` inside `backdrop-filter`) is a **Chromium extension**. There
 ## 9. Known limitations & future work
 
 - Refraction is unavailable on non-Chromium browsers (degrades to plain blur).
-- High-frequency filter maps are capped by a 32-entry LRU cache (`mapCache`).
+- High-frequency filter maps are capped by a 96-entry LRU cache (`mapCache`).
 - If a site's CSP restricts `img-src` (no `data:`), the `<feImage>` displacement maps are refused and it fails **completely silently** — see [§10](#10-userscript-liquid-glass-refraction).
 - Headless environments (`--dump-dom`) starve `rAF`, so spring animations emit only a few frames — verify "is the animation running" by checking whether the inline transform changes over time, not by screenshots.
-- **Large-area glass currently has a performance problem**: every glass surface maintains its own filter graph for `backdrop-filter` (SDF → displacement map → `feImage` + `feDisplacementMap`), and capture/composite cost grows linearly with surface size and count. Several large surfaces on screen at once (multiple bottom bars, full-size panels) visibly drop frames on mid/low-end devices; avoid spreading large-area glass in real products for now — see the future-work bullet above (Worker-based map generation, cross-surface sharing).
+- **Large-area glass is still expensive, and the cost sits in one place**: every glass surface maintains its own filter graph for `backdrop-filter` (SDF → displacement map → `feImage` + `feDisplacementMap`), and **only the `url(#…)` displacement graph spends frame time** — drop it and 20 surfaces go from 8.5 fps to 63 fps, the same speed as hiding every glass layer. The constraint is therefore the **count and area of refractive surfaces on screen**, not JS or layout; measurements, definition and the waste already removed are in [§11](#11-performance).
 - Future: move `glass-filter` map generation into a Worker; add a WebGL refraction fallback for non-Chromium (if WebGL is permitted at that point).
 
 ---
@@ -519,6 +519,83 @@ Two honest boundaries:
 - The canvas field **excludes `canvas.width/height`**. Those two values are the **culling state**: an off-screen surface has released its backing store, and which surfaces are off screen at the sampling instant depends on how far the frame loop had got — observed for real as a disagreement between two runs of the same build on the 102-surface screen. The CSS box, transform, blend mode and display value are layout-driven and do not move with culling, so they catch a compositing change without also catching the clock. The live-canvas count is printed as information and is **not** compared.
 
 `fidelity` starts a **fresh browser per destination**: reusing one tab stops the renderer answering `Runtime.evaluate` altogether after the third or fourth screen (reproducible by hand, by mounting and unmounting a few glass screens). Cold start is a couple of seconds, negligible next to a fingerprinted screen. A destination that fails is recorded, skipped, and makes the exit code non-zero — **a skipped destination is not a pass**.
+
+## 11. Performance
+
+One command reproduces every number below (needs `npm run dev` first):
+
+```bash
+npm run probe:perf
+```
+
+The definition: the 20 full-width glass rows of `ScrollContainer`, scrolled **one step per animation
+frame**, 30 frames. That definition is load-bearing — the scroll only advances when a frame is
+produced, **so the time the scroll takes is the frame budget**. Measured as "frames in a time window"
+instead, a slow build spends the whole window scrolling while a fast one finishes early and idles,
+which flatters the wrong side. Three passes per state, median reported, spread printed too.
+
+| state | fps (3 passes) | scroll took | main thread | filter attr writes | canvas ops |
+| --- | --- | --- | --- | --- | --- |
+| as shipped | **8.5** (6.9–9.2) | 3531 ms | 2.9% | **0** | 154 |
+| `url(#…)` dropped, `blur/saturate/brightness` kept | **63** (62–63.1) | 476 ms | 17.1% | 0 | 154 |
+| every glass layer hidden | **63** (62.9–63.7) | 476 ms | 13.3% | 0 | 154 |
+
+Two things fall straight out of it:
+
+1. **The entire frame cost is the SVG displacement graph.** Dropping `url(#…)` runs at exactly the
+   same speed as hiding the glass layers (63 = 63, both 476 ms) — plain
+   `blur() saturate() brightness()` is **essentially free** at this size and count.
+2. **Low fps next to low main-thread time means rasterisation, not JS.** The shipped row uses 2.9% of
+   the main thread and still only manages 8.5 fps, while the two 63 fps rows report *higher* main-thread
+   shares (in the teens) because their wall clock is short and the same JS is divided by a smaller
+   denominator. Any guess of the form "the JS must be too slow" is settled by those two columns.
+
+(§10.10 / §10.11 describe what the refraction **looks like**; this section describes what it **costs**.
+Same probe.)
+
+### 11.1 Waste that has been removed
+
+This chain used to run at a few fps on a screen of 20 surfaces, with the main thread sitting empty.
+The work was "same output, less of it" — **nothing was degraded**: refraction stays fully active while
+scrolling.
+
+| Where | Before | Now |
+| --- | --- | --- |
+| `glassFilter.update()` | wrote `feDisplacementMap[scale]` on every redraw, though a scroll changes none of its inputs (~1170 writes per scroll), and a filter-primitive write dirties the filter | remember the last value per node and skip it (the `fe writes = 0` column above) |
+| `buildMap` | evaluated the SDF over the **whole padded region** | scans only the rows and columns the bound admits, with one `Uint32Array.fill` for the neutral word; a full-scan oracle over 12 geometries is §10.12 |
+| `MAP_LIMIT` | 32 | 96 (one chromatic-aberration press asks for 18 entries, so 32 evicted its own working set) |
+| `isRefractionSupported()` | read `navigator.userAgentData.brands` once per frame per surface | memoised |
+| `GlassSurface` style writes | rewrote transform / clip-path / mask gradient / `backdrop-filter` on every redraw | skipped when unchanged |
+| the three decoration canvases | repainted on every scroll frame | skipped unless the paint signature moved (the `canvas ops = 154` / 30 frames column) |
+
+The reproducible figures above are the **ratio** (8.5 → 63, 7.4×) and `fe writes = 0`. The absolute
+pre-change numbers (~1170 writes, canvas ops ≈27× higher) were taken at the time with a throwaway
+script on the same machine, interleaved; that script was not kept, so do not quote those as a
+baseline — quote the ratio.
+
+**The other cost**, in the same command's second scene: holding a `Toggle` for 1.5 s rebuilds 15–18
+displacement maps, of which **63–80 ms is inside `canvas.toDataURL`** — a synchronous PNG encode on
+the main thread. It is spread across the dozen frames of the press animation, so frame rate does not
+show it (and §10.12's `fidelity` is unaffected), but it is the one place on that screen that comes
+close to a visible hitch. Lowering it further is a trade-off either way: move the encode off the
+frame (`OffscreenCanvas.convertToBlob` + `URL.createObjectURL`, writing `href` when it resolves —
+but `blob:` is accepted by fewer CSPs than `data:`, which costs the userscript usable sites), or
+pre-generate a ladder per `refractionHeight`.
+
+### 11.2 What is not solved
+
+The `url(#…)` displacement map is re-rasterised by the browser every frame, and **that scale is not
+negotiable**: 8.5 fps is the current price, 63 fps is the price of not refracting. The count and area
+of refractive surfaces on screen is therefore a hard budget. `FILTER_PAD` (a global 64) makes the
+filter region larger than the element itself — a 1408×160 row is rasterised as 1536×288 — so
+shrinking it per surface buys some back, but not a different order of magnitude.
+
+Any further headroom on this carrier comes from **rasterising less** (fewer refractive surfaces on
+screen, or smaller ones), not from faster JS. Dropping `backdrop-filter` and painting the backdrop
+yourself would recover the magnitude, but that route requires the application to know what the
+backdrop *is* — and the entire point of `backdrop` is refracting what is **genuinely behind** it
+(§3.3), not the application's own wallpaper, and it does not carry over to the userscript's
+arbitrary-site case. **That was explicitly rejected; do not raise it again.**
 
 ---
 

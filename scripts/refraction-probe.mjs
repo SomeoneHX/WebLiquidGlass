@@ -1294,6 +1294,286 @@ async function runFidelity(options) {
 }
 
 /* ------------------------------------------------------------------------------------------- */
+/* `perf` — where the frame time goes, measured rather than guessed                                */
+/* ------------------------------------------------------------------------------------------- */
+
+/**
+ * The performance work in this repo rests on one measurement: on a scrolling list of glass
+ * surfaces, essentially the whole cost is the `url(#…)` half of `backdrop-filter`. That number is
+ * only useful if it can be re-taken, so the ablation is a mode rather than a table in a README.
+ *
+ *   npm run dev                                            # in another terminal
+ *   node scripts/refraction-probe.mjs perf
+ *
+ * The scene is `ScrollContainer` — 20 full-width glass rows — scrolled 3000 px **one step per
+ * animation frame**. That definition matters: the scroll advances only when a frame is produced, so
+ * the time the scroll takes *is* the frame time, and there is no idle tail to dilute the average
+ * (measuring "frames in a window" instead lets a slow build spend the whole window scrolling while
+ * a fast one finishes early and sits idle, which flatters the wrong side).
+ *
+ * Three states, same scroll, same warmth:
+ *   shipped        whatever the app does today
+ *   no refraction  the same `blur() saturate() brightness()` with the `url(#…)` dropped
+ *   nothing        every glass layer hidden — the ceiling this page could reach
+ *
+ * The machine does not have to be quiet: `shipped → no refraction` is a ratio taken within one run,
+ * on one page, seconds apart. Absolute fps on a loaded desktop is not worth reading.
+ *
+ * The press scene is separate, and in its own browser, because a tab stops answering after a few
+ * heavy screens (see `fidelity`). It reports the other cost this repo had: `toDataURL` is a
+ * synchronous PNG encode, and a Toggle press rebuilt 18 displacement maps.
+ */
+
+const PERF_SCROLL_MS = 3000
+
+const PERF_INSTRUMENT = `(() => {
+  window.__perf = { mapCalls: 0, mapMs: 0, feWrites: 0, scaleWrites: 0, canvasOps: 0 }
+  const toDataURL = HTMLCanvasElement.prototype.toDataURL
+  HTMLCanvasElement.prototype.toDataURL = function (...a) {
+    const t = performance.now()
+    const r = toDataURL.apply(this, a)
+    window.__perf.mapCalls++
+    window.__perf.mapMs += performance.now() - t
+    return r
+  }
+  const setAttribute = Element.prototype.setAttribute
+  Element.prototype.setAttribute = function (n, v) {
+    if (this.tagName && String(this.tagName).indexOf('fe') === 0) {
+      window.__perf.feWrites++
+      if (n === 'scale') window.__perf.scaleWrites++
+    }
+    return setAttribute.call(this, n, v)
+  }
+  for (const name of ['clearRect', 'drawImage', 'fill', 'stroke', 'putImageData']) {
+    const original = CanvasRenderingContext2D.prototype[name]
+    CanvasRenderingContext2D.prototype[name] = function (...a) {
+      window.__perf.canvasOps++
+      return original.apply(this, a)
+    }
+  }
+})()`
+
+/** One scroll: `steps` frames, each advancing the scroller, so its duration is the frame budget. */
+const PERF_SCROLL = (steps, distance) => `new Promise((resolve) => {
+  const el = document.querySelector('.scroll-y') || document.scrollingElement
+  const from = el.scrollTop
+  const started = performance.now()
+  // Clamp to what the container can actually scroll, so all three states cover the same distance
+  // instead of whichever one happened to hit the end first.
+  const distance = Math.min(${distance}, el.scrollHeight - el.clientHeight)
+  let n = 0
+  const step = () => {
+    n++
+    el.scrollTop = from + (distance * n) / ${steps}
+    if (n < ${steps}) requestAnimationFrame(step)
+    else resolve({ frames: n, ms: performance.now() - started, from: Math.round(from), to: Math.round(el.scrollTop) })
+  }
+  requestAnimationFrame(step)
+})`
+
+const PERF_ABLATIONS = {
+  shipped: '',
+  'no refraction':
+    '.glass-surface__lens { -webkit-backdrop-filter: blur(6px) saturate(1.5) brightness(1.05) !important; backdrop-filter: blur(6px) saturate(1.5) brightness(1.05) !important; }',
+  nothing:
+    '.glass-surface__lens, .glass-surface__shadow, .glass-surface__overlay, .glass-surface__additive { display: none !important; }'
+}
+
+async function openPerfPage(cdp, options, createTarget) {
+  const { sessionId } = await createTarget(cdp)
+  const send = (method, params) => cdp.send(method, params, sessionId)
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  await send('Page.enable')
+  await send('Runtime.enable')
+  await send('Page.addScriptToEvaluateOnNewDocument', { source: PERF_INSTRUMENT })
+  await send('Emulation.setDeviceMetricsOverride', {
+    width: options.width,
+    height: options.height,
+    deviceScaleFactor: options.dpr,
+    mobile: false
+  })
+  await send('Page.navigate', { url: options.url })
+  await sleep(4000)
+  const evaluate = async (expression, awaitPromise = false) => {
+    const r = await withTimeout(
+      send('Runtime.evaluate', { expression, awaitPromise, returnByValue: true }),
+      30000,
+      'the renderer'
+    )
+    if (r.exceptionDetails) {
+      throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text)
+    }
+    return r.result?.value
+  }
+  const navigate = async (label) => {
+    await evaluate(`(() => {
+      const el = Array.from(document.querySelectorAll('.home__item')).find(e => e.textContent.trim() === ${JSON.stringify(label)})
+      if (!el) throw new Error('missing nav item: ' + ${JSON.stringify(label)})
+      el.scrollIntoView({ block: 'center', behavior: 'instant' })
+      return true
+    })()`)
+    await sleep(400)
+    const at = await evaluate(`(() => {
+      const el = Array.from(document.querySelectorAll('.home__item')).find(e => e.textContent.trim() === ${JSON.stringify(label)})
+      const r = el.getBoundingClientRect()
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+    })()`)
+    for (const type of ['mousePressed', 'mouseReleased']) {
+      await withTimeout(
+        send('Input.dispatchMouseEvent', {
+          type,
+          x: at.x,
+          y: at.y,
+          button: 'left',
+          clickCount: 1,
+          buttons: type === 'mousePressed' ? 1 : 0
+        }),
+        20000,
+        'the renderer (input)'
+      )
+    }
+    await sleep(2000)
+  }
+  return { send, evaluate, navigate, sleep }
+}
+
+async function runPerf(options) {
+  const base = options.url
+  try {
+    const res = await withTimeout(fetch(base), 4000, `the dev server at ${base}`)
+    if (!res.ok) throw new Error(String(res.status))
+  } catch (error) {
+    throw new Error(`no dev server answering at ${base} (${error.message}).\nStart one first: \`npm run dev\`.`)
+  }
+
+  const metrics = async (send) => {
+    await send('Performance.enable')
+    const { metrics: m } = await send('Performance.getMetrics')
+    const out = {}
+    for (const x of m) {
+      if (x.name === 'TaskDuration' || x.name === 'ScriptDuration') out[x.name] = x.value
+    }
+    return out
+  }
+  const measured = {}
+  await withChrome({ headed: options.headed, gpu: false }, async (cdp) => {
+    const page = await openPerfPage(cdp, options, async (c) => {
+      const { targetId } = await c.send('Target.createTarget', { url: 'about:blank' })
+      return c.send('Target.attachToTarget', { targetId, flatten: true })
+    })
+    await page.navigate('Scroll container')
+
+    for (const [name, css] of Object.entries(PERF_ABLATIONS)) {
+      await page.evaluate(
+        `(() => {
+          let s = document.getElementById('__perf-ablate')
+          if (!s) { s = document.createElement('style'); s.id = '__perf-ablate'; document.head.appendChild(s) }
+          s.textContent = ${JSON.stringify(css)}
+          return true
+        })()`
+      )
+      // Three passes, median reported. In the fast states a pass is only a few hundred ms, so a
+      // single scheduler hiccup on a loaded desktop moves the number by tens of fps; the spread is
+      // printed too, because a ratio quoted without one is a number pretending to be a fact.
+      const passes = []
+      let feWrites = 0
+      let canvasOps = 0
+      for (let pass = 0; pass < 3; pass++) {
+        await page.evaluate(`(() => { const el = document.querySelector('.scroll-y'); el.scrollTop = 0; return true })()`)
+        await page.sleep(600)
+        await page.evaluate(`(() => { window.__perf = { mapCalls: 0, mapMs: 0, feWrites: 0, scaleWrites: 0, canvasOps: 0 }; return true })()`)
+        const before = await metrics(page.send)
+        const run = await page.evaluate(PERF_SCROLL(30, options.scroll), true)
+        const after = await metrics(page.send)
+        const counters = await page.evaluate(
+          `(() => { const p = window.__perf; window.__perf = { mapCalls: 0, mapMs: 0, feWrites: 0, scaleWrites: 0, canvasOps: 0 }; return p })()`
+        )
+        const seconds = run.ms / 1000
+        passes.push({
+          fps: run.frames / seconds,
+          scrollMs: run.ms,
+          scrolled: run.to - run.from,
+          mainBusyPct: ((after.TaskDuration - before.TaskDuration) / seconds) * 100
+        })
+        feWrites = counters.feWrites
+        canvasOps = counters.canvasOps
+      }
+      const median = (xs) => [...xs].sort((a, b) => a - b)[1]
+      const fpsList = passes.map((x) => x.fps)
+      measured[name] = {
+        fps: +median(fpsList).toFixed(1),
+        fpsMin: +Math.min(...fpsList).toFixed(1),
+        fpsMax: +Math.max(...fpsList).toFixed(1),
+        scrollMs: Math.round(median(passes.map((x) => x.scrollMs))),
+        scrolled: median(passes.map((x) => x.scrolled)),
+        mainBusyPct: +median(passes.map((x) => x.mainBusyPct)).toFixed(1),
+        feWrites,
+        canvasOps
+      }
+    }
+  })
+
+  const press = await withChrome({ headed: options.headed, gpu: false }, async (cdp) => {
+    const page = await openPerfPage(cdp, options, async (c) => {
+      const { targetId } = await c.send('Target.createTarget', { url: 'about:blank' })
+      return c.send('Target.attachToTarget', { targetId, flatten: true })
+    })
+    await page.navigate('Toggle')
+    await page.evaluate(`(() => { window.__perf = { mapCalls: 0, mapMs: 0, feWrites: 0, scaleWrites: 0, canvasOps: 0 }; return true })()`)
+    const box = await page.evaluate(`(() => {
+      const e = document.querySelector('.glass-surface')
+      const r = e.getBoundingClientRect()
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 }
+    })()`)
+    for (const type of ['mousePressed', 'mouseReleased']) {
+      await page.send('Input.dispatchMouseEvent', {
+        type,
+        x: box.x,
+        y: box.y,
+        button: 'left',
+        clickCount: 1,
+        buttons: type === 'mousePressed' ? 1 : 0
+      })
+      if (type === 'mousePressed') await page.sleep(1500)
+    }
+    await page.sleep(400)
+    const counters = await page.evaluate(`window.__perf`)
+    return { mapRebuilds: counters.mapCalls, encodeMs: +counters.mapMs.toFixed(1) }
+  })
+
+  console.log(`\n=== frame time on a scrolling glass list (${options.width}×${options.height} @ dpr ${options.dpr}) ===`)
+  console.log(`ScrollContainer, ${options.scroll} px scrolled over 30 frames — the scroll only advances`)
+  console.log('when a frame is produced, so its duration is the frame budget.\n')
+  console.log('state                  fps (3 passes)   scroll ms   scrolled      main busy   fe writes   canvas ops')
+  for (const [name, r] of Object.entries(measured)) {
+    console.log(
+      `${name.padEnd(20)} ${String(r.fps).padStart(5)} (${String(r.fpsMin).padStart(5)}–${String(r.fpsMax).padStart(5)}) ` +
+        `${String(r.scrollMs).padStart(10)} ${String(r.scrolled).padStart(9)} px ` +
+        `${String(r.mainBusyPct).padStart(11)}% ${String(r.feWrites).padStart(11)} ${String(r.canvasOps).padStart(12)}`
+    )
+  }
+  const shipped = measured.shipped
+  const noRefraction = measured['no refraction']
+  const nothing = measured.nothing
+  if (shipped && noRefraction && nothing) {
+    console.log(
+      `\ndropping the url(#…) half: ${shipped.fps} → ${noRefraction.fps} fps ` +
+        `(${(noRefraction.fps / shipped.fps).toFixed(1)}×); hiding every glass layer: ${nothing.fps} fps ` +
+        `(${(nothing.fps / shipped.fps).toFixed(1)}×).`
+    )
+    console.log(
+      'the ratio is the portable number — it is taken within one run, on one page, seconds apart, so\n' +
+        'it does not care how loaded the machine is. Absolute fps does.'
+    )
+  }
+  console.log(
+    `\nToggle press, held 1.5 s: ${press.mapRebuilds} displacement maps rebuilt, ` +
+      `${press.encodeMs} ms inside canvas.toDataURL (synchronous PNG encode on the main thread).`
+  )
+  console.log('')
+}
+
+/* ------------------------------------------------------------------------------------------- */
 
 const argv = process.argv.slice(2)
 const mode = argv.find((a) => !a.startsWith('--')) ?? 'map'
@@ -1333,6 +1613,15 @@ else if (mode === 'render')
       .split(',')
       .map(Number)
   })
+else if (mode === 'perf')
+  await runPerf({
+    url: str('url', 'http://127.0.0.1:5173/'),
+    dpr: flag('dpr', 2),
+    width: flag('width', 1440),
+    height: flag('height', 900),
+    scroll: flag('scroll', 3000),
+    headed: has('headed')
+  })
 else if (mode === 'fidelity')
   await runFidelity({
     url: str('url', 'http://127.0.0.1:5173/'),
@@ -1347,6 +1636,7 @@ else {
   console.error(
     'usage: refraction-probe.mjs map\n' +
       '       refraction-probe.mjs band\n' +
+      '       refraction-probe.mjs perf [--url=http://127.0.0.1:5173/] [--scroll=300]\n' +
       '       refraction-probe.mjs fidelity [--url=http://127.0.0.1:5173/] [--baseline=<file>] [--write=<file>]\n' +
       '       refraction-probe.mjs render [--dpr=1] [--probe=ruler|shift|field] [--bg=ruler|checker|noise|xy] ' +
       '[--blur=0] [--bezel=18] [--scale=1] [--size=256x256] [--radius=128] [--lens=x,y] [--search=12] ' +
