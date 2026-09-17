@@ -13,6 +13,8 @@
     "stage:userscript": "node scripts/stamp-userscript.mjs 0 dist/liquid-glass-refract.user.js",
     "probe:map": "node scripts/refraction-probe.mjs map",
     "probe:render": "node scripts/refraction-probe.mjs render",
+    "probe:band": "node scripts/refraction-probe.mjs band",
+    "probe:fidelity": "node scripts/refraction-probe.mjs fidelity",
     "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {

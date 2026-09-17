@@ -188,6 +188,12 @@ npm run preview
 # userscript: syntax check / stage it into dist/ the way CI does (see §10.6)
 npm run check:userscript
 npm run stage:userscript
+
+# refraction probes (the first two are pure Node, zero dependencies; the last two use a real Chromium, `probe:fidelity` needs `npm run dev`)
+npm run probe:map         # encoder model: the 8-bit ladder of the displacement map (§10.10)
+npm run probe:band        # rim-band shortcut vs a full scan, byte for byte (§10.12)
+npm run probe:render      # sampler: a phase ruler measures where samples actually land (§10.10)
+npm run probe:fidelity    # render fingerprint of 13 destinations, for A/B across a change (§10.12)
 ```
 
 `density = 1`, so Kotlin `xx.dp` constants map 1:1 to CSS `px` with no conversion.
@@ -337,8 +343,15 @@ To regenerate (when upstream `src/core/glass-filter.ts` changes), strip types wi
 
 ```bash
 ./node_modules/.bin/tsc src/core/glass-filter.ts --target es2022 --module esnext --outDir /tmp/strip
-# then drop the `export ` prefixes from /tmp/strip/glass-filter.js and splice it into section 1 of the script
 ```
+
+There are exactly two post-processing steps: drop the **leading** `export ` prefixes (the previous revision had three: `FILTER_PAD` / `isRefractionSupported` / `createGlassFilter`), and the `svgRoot()` line below.
+
+**Do not hard-code the line range of section 1** — locate it with the same markers the probe uses: from the nearest preceding `/*` before `/** SVG refraction filter for`, to the nearest preceding `/*` before `* 2. Userscript host`. Assert that "the old block == the result of running the same pipeline against HEAD" before splicing, and refuse to write if it does not — that way a transformation that gains or loses a step is caught on step one.
+
+Afterwards, always run: `npm run check:userscript` + `npm run probe:band` + `npm run probe:render`.
+
+⚠️ **The core must not depend on `ctx.canvas`**: `probe:map` evaluates section 1 in Node against a fake DOM whose canvas `getContext()` provides **only** `createImageData` / `putImageData`, with **no `canvas` back-reference**. Reusing the map canvas once produced `ctx.canvas.toDataURL(...)`, which killed `npm run probe:map` outright (`TypeError: ... reading 'toDataURL'`). The fix is to return the **element itself** from the helper rather than going through `ctx`.
 
 Only **one line** in the script differs from the extraction source: `document.body || document.documentElement` in `svgRoot()`, so it can run before `<body>` exists (which is the case for `@require`).
 
@@ -471,6 +484,41 @@ So "it looks smooth" and "it is arithmetic on a whole-pixel lattice" are both tr
 | **Use the B channel as a coverage mask**: encode rim-vs-interior in the unused B, take alpha with `feColorMatrix`, cut the rim out with `feComposite in`, `feComposite over` it back onto `SourceGraphic` | interior pixel-identical at **any** `amount` | 3 extra primitives per surface, inside `glass-filter.ts`'s graph builder |
 | `feOffset` counter-offset (the alternative floated in §10.9) | **Rejected.** At `bias = 1.0000` it does cancel (`rms 0.00`); at `bias = 0.502` it leaves 0.5 px *and* resamples the interior into a 50/50 blend of neighbouring pixels (`rms` **69/255** on a noise backdrop) | trades a 1 px jump for a 0.5 px blur. It does prove something useful, though: **`feOffset` is the only sub-pixel-capable primitive in this chain** |
 | Clamp `refractionAmount` so `2·amount·vmax < 255` | interior constant, one-line change | caps what the playground exists to explore |
+
+### 10.12 Regression checks: `probe:band` and `probe:fidelity`
+
+§10.10 and §10.11 answer "what does the refraction **look like**". This section answers "**did a change quietly alter it**". The reason is direct: every "same output, less work" optimisation in `glass-filter.ts` — a displacement map that only scans the rim band, writes that are skipped when the value is unchanged, decoration canvases that are not repainted while scrolling — is a claim about **equality**, and no screenshot can substantiate one.
+
+```bash
+npm run probe:band        # pure Node, zero dependencies, no browser and no dev server; usable as a CI gate
+npm run probe:fidelity    # needs `npm run dev` first; a render fingerprint of 13 destinations × 7 fields
+```
+
+**`band`**: `buildMap` no longer walks the whole padded region, only the rows and columns its SDF bound admits. That bound is a product of **reasoning**, and reasoning can be wrong — a band that is too tight silently drops real rim pixels, the refraction goes subtly wrong, and nothing else in the repo notices (the map still encodes, the filter still runs, the tests still pass). So it is checked against a **full scan**: `sdf` / `gradSdf` / `clampByte` come from the shipped core (exposed by `loadCore`), i.e. the oracle re-states **only the part under test — the loop structure** — and not the maths. The neutral word is likewise **read back out of the shipped bitmap** rather than re-declared, so changing it cannot make the two implementations agree on the wrong answer.
+
+12 geometries × spectral branches, compared byte for byte. Both historical bugs are in the script's comments, and both were caught by exactly this check:
+
+| Mistake | Consequence |
+| --- | --- |
+| Using `d ≥ max(qx,qy) − r` as a lower bound | the inequality holds, but it does not imply `max ≥ r − bezel` → **the diagonals just outside a rounded corner are dropped** |
+| An exclusive upper bound `to = w` on the right edge | `d` is exactly 0 at `x = w`, and 0 is inside the rim test → **the last column is dropped** |
+
+Re-inject the second one and `band` reports `NO` immediately, naming the first differing pixel as `x = 1408, y = 32` — the test has teeth, and it localises.
+
+**`fidelity`**: fingerprints 7 fields on all 13 destinations — `feImage` href hashes, primitive boxes, `feDisplacementMap[scale]`, `<filter>` regions, computed lens styles, decoration-canvas CSS box + transform + blend + display, and the surface count. Record, change one thing, compare:
+
+```bash
+node scripts/refraction-probe.mjs fidelity --write=/tmp/base.json
+# ...make one change...
+node scripts/refraction-probe.mjs fidelity --baseline=/tmp/base.json   # exit 1 on any mismatch
+```
+
+Two honest boundaries:
+
+- It is an **A/B tool, not a gate**. The fingerprint covers the **bytes** of the displacement maps, so repeat runs of one build agree exactly (verified), but it is tied to the renderer version — a browser update legitimately changes it. Hence "record a baseline → change one thing → compare", not a constant assertion in CI.
+- The canvas field **excludes `canvas.width/height`**. Those two values are the **culling state**: an off-screen surface has released its backing store, and which surfaces are off screen at the sampling instant depends on how far the frame loop had got — observed for real as a disagreement between two runs of the same build on the 102-surface screen. The CSS box, transform, blend mode and display value are layout-driven and do not move with culling, so they catch a compositing change without also catching the clock. The live-canvas count is printed as information and is **not** compared.
+
+`fidelity` starts a **fresh browser per destination**: reusing one tab stops the renderer answering `Runtime.evaluate` altogether after the third or fourth screen (reproducible by hand, by mounting and unmounting a few glass screens). Cold start is a couple of seconds, negligible next to a fingerprinted screen. A destination that fails is recorded, skipped, and makes the exit code non-zero — **a skipped destination is not a pass**.
 
 ---
 

@@ -143,7 +143,7 @@ function loadCore() {
     'document',
     'navigator',
     'window',
-    `${body}\nreturn { buildMap, FILTER_PAD };`
+    `${body}\n// sdf / gradSdf / clampByte are returned for the band oracle, which re-states the\n  // loop structure under test rather than the maths.\n  return { buildMap, FILTER_PAD, sdf, gradSdf, clampByte };`
   )
   const core = factory(document, { userAgent: 'chrome' }, {})
   return { core, canvases }
@@ -403,7 +403,27 @@ class CDP {
   }
 }
 
+/**
+ * A fixed port range collides with a browser a previous attempt left behind, and the probe then
+ * talks to whatever is already listening (`chrome did not expose a debugging endpoint`). That was
+ * survivable when a run started one browser; `fidelity` starts one per destination, so retry on a
+ * fresh port — but only for that failure, so a real assertion failure is never swallowed.
+ */
 async function withChrome({ headed, gpu }, fn) {
+  let lastError
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      return await onceChrome({ headed, gpu }, fn)
+    } catch (error) {
+      lastError = error
+      if (!/debugging endpoint/.test(String(error.message))) throw error
+      await new Promise((r) => setTimeout(r, 400))
+    }
+  }
+  throw lastError
+}
+
+async function onceChrome({ headed, gpu }, fn) {
   const port = 9333 + Math.floor(Math.random() * 200)
   const profile = mkdtempSync(join(tmpdir(), 'refract-probe-'))
   const flags = [
@@ -818,6 +838,462 @@ async function runRender(options) {
 }
 
 /* ------------------------------------------------------------------------------------------- */
+/* `band` — is the rim-band shortcut still a superset of the rim?                                 */
+/* ------------------------------------------------------------------------------------------- */
+
+/**
+ * `buildMap` no longer visits every pixel of the padded region: it fills the bitmap with the
+ * neutral word and then walks only the rows and columns its SDF bound admits. That is what makes a
+ * map build cheap enough to sit inside a press animation, and the bound is a piece of *reasoning* —
+ * which can be wrong. A band that is too tight silently drops rim pixels, the refraction goes
+ * subtly wrong, and nothing else in the repo notices: the map still encodes, the filter still
+ * runs, the tests still pass.
+ *
+ * So this mode checks the shortcut against a full scan:
+ *
+ *   node scripts/refraction-probe.mjs band
+ *
+ * `sdf` / `gradSdf` / `clampByte` come from the shipped core (exposed by `loadCore`), so the oracle
+ * re-states only the **loop structure** — the one thing under test — and not the maths. The neutral
+ * word is read back out of the shipped bitmap rather than re-derived, so a change to it cannot make
+ * the two implementations agree on the wrong answer.
+ *
+ * History, because both of these were real and both were invisible without this check:
+ *   - a bound of `d >= max(qx, qy) - r` is true, but it does not imply `max(qx, qy) >= r - bezel`,
+ *     so it drops the diagonals just outside a rounded corner;
+ *   - the right edge needs an *inclusive* bound (`x <= w`): `d` is exactly 0 on `x = w`, and 0 is
+ *     inside the rim test.
+ */
+
+/** The full scan, frozen as the oracle. Every pixel of the padded region is visited. */
+function fullScanMap(core, spec, branch, neutral) {
+  const w = Math.max(1, Math.round(spec.width))
+  const h = Math.max(1, Math.round(spec.height))
+  const pad = core.FILTER_PAD
+  const cw = w + pad * 2
+  const ch = h + pad * 2
+  const [tl, tr, br, bl] = spec.cornerRadii
+  const bezel = Math.max(0.5, spec.refractionHeight)
+  const depth = spec.depthEffect ? 1 : 0
+  const hw = w / 2
+  const hh = h / 2
+  const data = new Uint8ClampedArray(cw * ch * 4)
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = neutral[0]
+    data[i + 1] = neutral[1]
+    data[i + 2] = neutral[2]
+    data[i + 3] = neutral[3]
+  }
+
+  const rim = []
+  let vmax = 0
+  for (let j = 0; j < ch; j++) {
+    const y = j - pad
+    for (let i = 0; i < cw; i++) {
+      const x = i - pad
+      const d = core.sdf(x, y, w, h, tl, tr, br, bl)
+      if (d > 0 || d < -bezel) continue
+
+      const t = Math.min(1, Math.max(0, 1 + d / bezel))
+      const falloff = 1 - Math.sqrt(Math.max(0, 1 - t * t))
+      let gx =
+        core.gradSdf(x + 1, y, w, h, tl, tr, br, bl) - core.gradSdf(x - 1, y, w, h, tl, tr, br, bl)
+      let gy =
+        core.gradSdf(x, y + 1, w, h, tl, tr, br, bl) - core.gradSdf(x, y - 1, w, h, tl, tr, br, bl)
+      let length = Math.hypot(gx, gy)
+      if (length > 0) {
+        gx /= length
+        gy /= length
+      }
+      if (depth !== 0) {
+        const cx = x - hw
+        const cy = y - hh
+        const centreLength = Math.hypot(cx, cy)
+        if (centreLength > 0) {
+          gx += cx / centreLength
+          gy += cy / centreLength
+          length = Math.hypot(gx, gy)
+          if (length > 0) {
+            gx /= length
+            gy /= length
+          }
+        }
+      }
+      const dispersion = ((x - hw) * (y - hh)) / (hw * hh)
+      const m = falloff * (1 + branch * dispersion)
+      if (m > vmax) vmax = m
+      rim.push({ index: (j * cw + i) * 4, gx, gy, m })
+    }
+  }
+
+  const k = vmax > 0 ? 127 / vmax : 0
+  for (const pixel of rim) {
+    if (pixel.m <= 0) continue
+    const s = pixel.m * k
+    data[pixel.index] = core.clampByte(128 - pixel.gx * s)
+    data[pixel.index + 1] = core.clampByte(128 - pixel.gy * s)
+  }
+  return { data, vmax, rimPixels: rim.length }
+}
+
+/**
+ * One shipped `buildMap` run: a fresh core per call, because the module caches its scratch canvas
+ * and a second build on the same instance would not hand a new one to the stub.
+ */
+function shippedMap(spec, branch) {
+  const { core, canvases } = loadCore()
+  canvases.length = 0
+  const entry = core.buildMap(spec, branch)
+  const image = canvases[canvases.length - 1]?.image
+  if (!image) throw new Error('the core never put an ImageData on its canvas')
+  return { core, image, vmax: entry.vmax }
+}
+
+/** Shapes chosen to cover every branch of the band bound, including the two that used to fail. */
+const BAND_CASES = [
+  ['ScrollContainer row', 1408, 160, 32, 16, false],
+  ['ScrollContainer row (wide bezel)', 1408, 160, 32, 32, false],
+  ['ScrollContainer row (bezel > r)', 1408, 160, 32, 48, false],
+  ['LiquidButton', 200, 40, 20, 12, false],
+  ['LiquidToggle thumb (capsule)', 64, 28, 14, 5, false],
+  ['Toggle thumb, exact numbers', 40, 24, 12, 5, false],
+  ['ControlCenter tile', 400, 300, 24, 24, true],
+  ['Rectangle (r = 0)', 100, 100, 0, 8, false],
+  ['Mixed radii', 300, 200, 30, 16, false],
+  ['bezel > r on a small box', 160, 48, 24, 48, false],
+  ['Capsule', 50, 50, 25, 25, false],
+  ['Large radius, thin bezel', 300, 300, 150, 10, true]
+]
+
+function runBand() {
+  console.log('\n=== rim-band shortcut vs full scan ===')
+  console.log(
+    'the shipped buildMap walks only the rows/columns its SDF bound admits; the oracle walks all.\n' +
+      'A single differing byte means the bound is no longer a superset of the rim.\n'
+  )
+  console.log(
+    'case                              branch      rim px   bytes   identical   shipped ms   oracle ms'
+  )
+
+  let failures = 0
+  for (const [name, w, h, r, bezel, depth] of BAND_CASES) {
+    const spec = {
+      width: w,
+      height: h,
+      cornerRadii: [r, r, r, r],
+      refractionHeight: bezel,
+      depthEffect: depth,
+      chromaticAberration: r === 0 ? false : true
+    }
+    // `Mixed radii` keeps its own corners; the tuple above is a single radius everywhere else.
+    if (name === 'Mixed radii') spec.cornerRadii = [30, 10, 50, 20]
+
+    for (const branch of [0, 1, -1]) {
+      if (!spec.chromaticAberration && branch !== 0) continue
+
+      const shippedStart = process.hrtime.bigint()
+      const { core, image } = shippedMap(spec, branch)
+      const shippedMs = Number(process.hrtime.bigint() - shippedStart) / 1e6
+
+      // The neutral word, read back from a corner of the padded region: far outside every shape.
+      const data = image.data
+      const neutral = [data[0], data[1], data[2], data[3]]
+      for (const at of [0, 4, (image.width - 1) * 4]) {
+        if (data[at] !== neutral[0] || data[at + 1] !== neutral[1] || data[at + 2] !== neutral[2]) {
+          throw new Error(`${name}: the padded margin is not a uniform neutral — the oracle's neutral word would be wrong`)
+        }
+      }
+
+      const oracleStart = process.hrtime.bigint()
+      const oracle = fullScanMap(core, spec, branch, neutral)
+      const oracleMs = Number(process.hrtime.bigint() - oracleStart) / 1e6
+
+      let firstDiff = -1
+      let diffs = 0
+      for (let i = 0; i < data.length; i++) {
+        if (data[i] !== oracle.data[i]) {
+          if (firstDiff < 0) firstDiff = i
+          diffs++
+        }
+      }
+      const identical = diffs === 0
+      if (!identical) failures++
+
+      const branchLabel = branch === 0 ? 'green' : branch === 1 ? 'red' : 'blue'
+      console.log(
+        `${name.padEnd(33)} ${branchLabel.padEnd(6)} ${String(oracle.rimPixels).padStart(8)} ` +
+          `${String(data.length).padStart(7)}   ${(identical ? 'yes' : 'NO').padStart(9)}   ` +
+          `${shippedMs.toFixed(1).padStart(10)}   ${oracleMs.toFixed(1).padStart(9)}`
+      )
+      if (!identical) {
+        const px = firstDiff >> 2
+        console.log(
+          `      ✗ ${diffs} differing bytes; first at byte ${firstDiff} (pixel ${px}, ` +
+            `x = ${(px % image.width) - core.FILTER_PAD}, y = ${Math.floor(px / image.width) - core.FILTER_PAD})`
+        )
+      }
+    }
+  }
+
+  console.log(
+    `\n${failures === 0 ? '✓' : '✗'} ${failures === 0 ? 'every case is byte-identical to a full scan' : `${failures} case/branch combinations differ from a full scan`}` +
+      '\n  a full scan would pass this test trivially, so the `shipped ms` vs `oracle ms` column\n' +
+      '  is worth an eye too: if the two converge, the shortcut has been lost even though the\n' +
+      '  output is still correct.\n'
+  )
+  if (failures > 0) process.exitCode = 1
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* `fidelity` — did a change alter a single byte of what the 13 screens render?                     */
+/* ------------------------------------------------------------------------------------------- */
+
+/**
+ * The optimisations in this repo are all "same output, less work" — a band scan that must be a
+ * superset of the rim, no-op writes that must be skipped, decoration canvases that must not be
+ * repainted because their content does not depend on where the surface sits. Every one of those is
+ * a claim about *equivality*, and none of them is checked by eyeballing a screenshot.
+ *
+ * This mode fingerprints what the refraction and the glass layers actually produced on every
+ * destination, so two builds can be compared field by field:
+ *
+ *   npm run dev                                               # in another terminal
+ *   node scripts/refraction-probe.mjs fidelity --write=/tmp/base.json
+ *   ...make a change...
+ *   node scripts/refraction-probe.mjs fidelity --baseline=/tmp/base.json
+ *
+ * It is an A/B tool rather than a pass/fail gate: the hashes cover *map bytes*, so they are stable
+ * across runs of the same build (verified) but tied to the renderer version, so a browser update
+ * legitimately changes them. Record a baseline, change one thing, compare.
+ */
+
+const FIDELITY_DESTINATIONS = [
+  'Buttons',
+  'Toggle',
+  'Slider',
+  'Bottom tabs',
+  'Dialog',
+  'Lock screen (SDF texture)',
+  'Control center',
+  'Magnifier',
+  'Glass playground',
+  'Adaptive luminance glass',
+  'Progressive blur',
+  'Scroll container',
+  'Lazy scroll container'
+]
+
+const FIDELITY_FINGERPRINT = `(() => {
+  const fnv = (s) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) } return (h >>> 0).toString(16) }
+  const images = Array.from(document.querySelectorAll('feImage')).map((e) => {
+    const href = e.getAttribute('href') || ''
+    return fnv(href) + ':' + href.length
+  })
+  const lens = Array.from(document.querySelectorAll('.glass-surface__lens')).map((e) => {
+    const cs = getComputedStyle(e)
+    return [cs.backdropFilter, cs.transform, cs.clipPath, cs.opacity, cs.maskImage].join(' ')
+  })
+  const canvases = Array.from(document.querySelectorAll('.glass-surface canvas')).map((c) => {
+    const cs = getComputedStyle(c)
+    // The backing-store dimensions are deliberately absent. Those are the *culling* state: an
+    // off-screen surface has had its canvas released, and which surfaces are off screen at the
+    // instant of sampling depends on how far the frame loop had got — measured as a real
+    // disagreement between two runs of the same build on the 102-surface screen. The CSS box,
+    // transform, blend mode and display value are layout-driven and do not move with culling, so
+    // they catch a compositing change without also catching the clock. liveCanvases is reported
+    // alongside as information, and deliberately not compared.
+    return [cs.left, cs.top, cs.width, cs.height, cs.transform, cs.mixBlendMode, cs.display].join(',')
+  })
+  return {
+    surfaces: document.querySelectorAll('.glass-surface').length,
+    feImages: images.length,
+    maps: fnv(images.join('|')),
+    scales: Array.from(document.querySelectorAll('feDisplacementMap')).map((e) => e.getAttribute('scale')).join(','),
+    regions: Array.from(document.querySelectorAll('filter')).map((f) => [f.getAttribute('x'), f.getAttribute('y'), f.getAttribute('width'), f.getAttribute('height')].join(',')).join(';'),
+    lens: fnv(lens.join('|')),
+    canvases: fnv(canvases.join('|')),
+    liveCanvases: Array.from(document.querySelectorAll('.glass-surface canvas')).filter((c) => c.width > 0).length
+  }
+})()`
+
+const FIDELITY_FIELDS = ['surfaces', 'feImages', 'maps', 'scales', 'regions', 'lens', 'canvases']
+
+function withTimeout(promise, ms, label) {
+  let timer
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} did not answer within ${ms} ms`)), ms)
+    })
+  ])
+}
+
+async function runFidelity(options) {
+  const base = options.url
+  try {
+    const res = await withTimeout(fetch(base), 4000, `the dev server at ${base}`)
+    if (!res.ok) throw new Error(String(res.status))
+  } catch (error) {
+    throw new Error(
+      `no dev server answering at ${base} (${error.message}).\n` +
+        'Start one first: `npm run dev`.'
+    )
+  }
+
+  const report = { url: base, destinations: {} }
+
+  /**
+   * One browser per destination, not one per run.
+   *
+   * Reusing a tab dies on the third or fourth screen: the renderer stops answering
+   * `Runtime.evaluate` outright. That is not this script's bug — it reproduces by hand (mount and
+   * unmount a handful of glass screens and the tab goes unresponsive), and a fresh browser per
+   * screen is the only shape that survives it. Cold start is a couple of seconds, which is nothing
+   * next to a fingerprinted screen.
+   */
+  const failed = []
+  for (const destination of FIDELITY_DESTINATIONS) {
+    process.stdout.write('  ' + destination.padEnd(28) + ' ')
+    let fingerprint
+    try {
+    fingerprint = await withChrome({ headed: options.headed, gpu: false }, async (cdp) => {
+      const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' })
+      const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true })
+      const send = (method, params) => cdp.send(method, params, sessionId)
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+      const label = JSON.stringify(destination)
+
+      await send('Page.enable')
+      await send('Runtime.enable')
+      await send('Emulation.setDeviceMetricsOverride', {
+        width: options.width,
+        height: options.height,
+        deviceScaleFactor: options.dpr,
+        mobile: false
+      })
+      await send('Page.navigate', { url: base })
+      await sleep(4000)
+
+      const evaluate = async (expression) => {
+        const r = await withTimeout(
+          send('Runtime.evaluate', { expression, returnByValue: true }),
+          20000,
+          'the renderer (' + destination + ')'
+        )
+        if (r.exceptionDetails) {
+          throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text)
+        }
+        return r.result?.value
+      }
+
+      const pick = (body) =>
+        '(() => { const el = Array.from(document.querySelectorAll(".home__item"))' +
+        '.find(e => e.textContent.trim() === ' + label + '); ' +
+        'if (!el) throw new Error("missing nav item: " + ' + label + '); ' + body + ' })()'
+
+      await evaluate(pick('el.scrollIntoView({ block: "center", behavior: "instant" }); return true'))
+      await sleep(400)
+      const at = await evaluate(
+        pick('const r = el.getBoundingClientRect(); return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }')
+      )
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await withTimeout(
+          send('Input.dispatchMouseEvent', {
+            type,
+            x: at.x,
+            y: at.y,
+            button: 'left',
+            clickCount: 1,
+            buttons: type === 'mousePressed' ? 1 : 0
+          }),
+          20000,
+          'the renderer (' + destination + ', input)'
+        )
+      }
+      await sleep(2000)
+
+      // A fixed scroll offset, so the same rows are on screen in both runs.
+      await evaluate(
+        '(() => { const el = document.querySelector(".scroll-y"); if (el) el.scrollTop = 600; return true })()'
+      )
+      await sleep(900)
+      return evaluate(FIDELITY_FINGERPRINT)
+    })
+    } catch (error) {
+      failed.push(destination)
+      process.stdout.write('FAILED — ' + error.message + '\n')
+      continue
+    }
+    report.destinations[destination] = fingerprint
+    process.stdout.write(
+      'surfaces ' + String(fingerprint.surfaces).padStart(3) +
+        '  maps ' + fingerprint.maps +
+        '  lens ' + fingerprint.lens +
+        '  canvases ' + fingerprint.canvases +
+        '  (live ' + fingerprint.liveCanvases + ')\n'
+    )
+  }
+
+  const total = (d) => FIDELITY_FIELDS.map((f) => d[f]).join('|')
+
+  if (options.baseline) {
+    let baseline
+    try {
+      baseline = JSON.parse(readFileSync(options.baseline, 'utf8'))
+    } catch (error) {
+      throw new Error(`could not read --baseline=${options.baseline} (${error.message})`)
+    }
+    console.log(`\n=== fidelity vs ${options.baseline} ===\n`)
+    let differing = 0
+    for (const destination of FIDELITY_DESTINATIONS) {
+      const before = baseline.destinations?.[destination]
+      const after = report.destinations[destination]
+      if (!before) {
+        console.log(`  ${destination.padEnd(28)} (absent from the baseline)`)
+        continue
+      }
+      const bad = FIDELITY_FIELDS.filter((f) => String(before[f]) !== String(after[f]))
+      if (bad.length === 0) {
+        console.log(`  ${destination.padEnd(28)} identical   maps ${after.maps}  lens ${after.lens}  canvases ${after.canvases}`)
+      } else {
+        differing++
+        console.log(`  ${destination.padEnd(28)} DIFFERS     ${bad.join(', ')}`)
+        for (const f of bad) console.log(`      ${f}: ${before[f]} -> ${after[f]}`)
+      }
+    }
+    const beforeTotal = new Set(Object.values(baseline.destinations ?? {}).map(total)).size
+    console.log(
+      `\n${differing === 0 ? '✓' : '✗'} ${differing === 0 ? 'no destination changed' : `${differing} destination(s) changed`}` +
+        `  (baseline covers ${Object.keys(baseline.destinations ?? {}).length} destinations, ${beforeTotal} distinct fingerprints)\n`
+    )
+    if (differing > 0) process.exitCode = 1
+  } else {
+    console.log('\n=== fidelity fingerprint ===')
+    console.log('(record one with --write=<file>, then compare a change with --baseline=<file>)\n')
+    for (const destination of FIDELITY_DESTINATIONS) {
+      const d = report.destinations[destination]
+      console.log(
+        `  ${destination.padEnd(28)} surfaces ${String(d.surfaces).padStart(3)}  maps ${d.maps}  scales [${d.scales.slice(0, 28)}]  lens ${d.lens}  canvases ${d.canvases}`
+      )
+    }
+    console.log('')
+  }
+
+  if (failed.length > 0) {
+    console.log(
+      `\n✗ ${failed.length} destination(s) could not be fingerprinted: ${failed.join(', ')}` +
+        '\n  a skipped destination is not a pass — the comparison below only covers what ran.\n'
+    )
+    process.exitCode = 1
+  }
+
+  if (options.write) {
+    writeFileSync(options.write, JSON.stringify(report, null, 2))
+    console.log(`wrote ${options.write}\n`)
+  }
+}
+
+/* ------------------------------------------------------------------------------------------- */
 
 const argv = process.argv.slice(2)
 const mode = argv.find((a) => !a.startsWith('--')) ?? 'map'
@@ -836,6 +1312,7 @@ function lensOption() {
 }
 
 if (mode === 'map') runMap()
+else if (mode === 'band') runBand()
 else if (mode === 'render')
   await runRender({
     dpr: flag('dpr', 1),
@@ -856,9 +1333,21 @@ else if (mode === 'render')
       .split(',')
       .map(Number)
   })
+else if (mode === 'fidelity')
+  await runFidelity({
+    url: str('url', 'http://127.0.0.1:5173/'),
+    dpr: flag('dpr', 2),
+    width: flag('width', 1440),
+    height: flag('height', 900),
+    baseline: str('baseline', null),
+    write: str('write', null),
+    headed: has('headed')
+  })
 else {
   console.error(
     'usage: refraction-probe.mjs map\n' +
+      '       refraction-probe.mjs band\n' +
+      '       refraction-probe.mjs fidelity [--url=http://127.0.0.1:5173/] [--baseline=<file>] [--write=<file>]\n' +
       '       refraction-probe.mjs render [--dpr=1] [--probe=ruler|shift|field] [--bg=ruler|checker|noise|xy] ' +
       '[--blur=0] [--bezel=18] [--scale=1] [--size=256x256] [--radius=128] [--lens=x,y] [--search=12] ' +
       '[--amounts=…] [--depth] [--headed] [--gpu]'

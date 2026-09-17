@@ -188,6 +188,12 @@ npm run preview
 # 用户脚本：语法校验 / 按 CI 的方式打版到 dist/（详见 §10.6）
 npm run check:userscript
 npm run stage:userscript
+
+# 折射探针（前两条纯 Node 零依赖；后两条用真实 Chromium，`probe:fidelity` 需要先 npm run dev）
+npm run probe:map         # 编码层模型：位移图的 8 位阶梯（§10.10）
+npm run probe:band        # 边缘带捷径 vs 全扫描，逐字节对照（§10.12）
+npm run probe:render      # 采样层：相位标尺测出真实取样位置（§10.10）
+npm run probe:fidelity    # 13 个目的地的渲染指纹，用于改动前后 A/B（§10.12）
 ```
 
 `density = 1`，所以 Kotlin 里的 `xx.dp` 常量 1:1 映射成 CSS `px`，不做任何换算。
@@ -337,8 +343,15 @@ npm run dev                 # 浏览器里验证（把脚本粘进测试页即�
 
 ```bash
 ./node_modules/.bin/tsc src/core/glass-filter.ts --target es2022 --module esnext --outDir /tmp/strip
-# 再把 /tmp/strip/glass-filter.js 的 `export ` 前缀去掉，拼到脚本的第 1 段之前/之后
 ```
+
+后处理只有两步：去掉**行首**的 `export ` 前缀（旧版恰好 3 处：`FILTER_PAD` / `isRefractionSupported` / `createGlassFilter`），以及下面那一行 `svgRoot()`。
+
+**定位第 1 段不要写死行号**，用与探针相同的标记：从 `/** SVG refraction filter for` 之前最近的 `/*`，到 `* 2. Userscript host` 之前最近的 `/*`。拼接前先断言"旧块 == 对 HEAD 跑一遍同样流程的结果"，不等就拒绝写入——变换一旦有多余或遗漏，第一步就被拦下。
+
+改完必须跑：`npm run check:userscript` + `npm run probe:band` + `npm run probe:render`。
+
+⚠️ **核心不许依赖 `ctx.canvas`**：`probe:map` 会在 Node 里用一套假 DOM 求值第 1 段，其假 canvas 的 `getContext()` 只提供 `createImageData` / `putImageData`，**没有 `canvas` 反向引用**。曾经为了复用画布写成 `ctx.canvas.toDataURL(...)`，直接把 `npm run probe:map` 打挂（`TypeError: ... reading 'toDataURL'`）。正确做法是让 helper 返回**元素本身**，而不是绕道 `ctx`。
 
 脚本内只有**一行**与提取源不同：`svgRoot()` 里 `document.body || document.documentElement`，以便在 `<body>` 存在之前执行（`@require` 就是这种情况）。
 
@@ -471,6 +484,41 @@ amount | scale | neutral bias | predicted | sample offset | content shift | rms
 | **B 通道当遮罩**：把"边框/内部"编进没用到的 B，`feColorMatrix` 取 alpha + `feComposite in` 切出边框 + `feComposite over` 压回 `SourceGraphic` | 内部在**任意** `amount` 下逐像素恒等 | 每个表面多 3 个原语；改动落在 `glass-filter.ts` 的图构建里 |
 | `feOffset` 反向补偿（§10.9 提过的备选） | **否决**。`bias = 1.0000` 时确实抵消（rms 0.00）；`bias = 0.502` 时残留 0.5 px 且内部被插值成相邻像素的 50/50 混合（噪声背景下 rms **69/255**） | 拿"1 px 整跳"换"0.5 px 模糊"，不值；但它证明了一件有用的事——**`feOffset` 是这条链里唯一能亚像素定位的原语** |
 | 把 `refractionAmount` 夹到 `2·amount·vmax < 255` | 内部恒定，一行改动 | 等于给游乐场的探索范围封顶 |
+
+### 10.12 回归验证：`probe:band` 与 `probe:fidelity`
+
+§10.10 / §10.11 的两条口径回答"折射**看起来**是什么"，这一节的两条回答"**改动有没有偷偷改变它**"。加它们的原因很直接：`glass-filter.ts` 里所有"同输出、少做事"的优化——只扫描边缘带的位移图、跳过同值写入、滚动时不重绘装饰画布——都是关于**等价性**的断言，而没有任何一张截图能证明它们。
+
+```bash
+npm run probe:band        # 纯 Node、零依赖、不需要浏览器也不需要 dev server；可直接当 CI 门禁
+npm run probe:fidelity    # 需要先 `npm run dev`；13 个目的地 × 7 个字段的渲染指纹
+```
+
+**`band`**：`buildMap` 不再遍历整个 padded 区域，只走它的 SDF 边界允许的行列。这条边界是**推理**的产物，而推理会错——带取窄了就会静默丢掉真实边缘像素，折射微妙地失真，而仓库里其它任何东西都发现不了（图照编、滤镜照跑、测试照过）。所以它拿一个**全扫描**做对照：`sdf` / `gradSdf` / `clampByte` 都取自已提交的核心（由 `loadCore` 暴露），即**只重述被测试的那部分——循环结构**，不重述数学。中性灰也一样，是**从已提交的位图里读回来**的，不是另写一遍常量，所以改了中性值也不会让两边在错误答案上"达成一致"。
+
+12 种几何 × 光谱分支逐字节比对。两个历史上的真 bug 都写进了脚本注释，也正是这个检查抓出来的：
+
+| 错误 | 后果 |
+| --- | --- |
+| 用 `d ≥ max(qx,qy) − r` 当下界 | 该不等式成立，但推不出 `max ≥ r − bezel` → **漏掉圆角外侧的对角线** |
+| 右边界用排他上界 `to = w` | `x = w` 处 `d` 恰为 0，而 0 在边缘测试之内 → **漏掉最后一列** |
+
+把第二条重新注回脚本，`band` 立刻报 `NO` 并指出首个差异像素是 `x = 1408, y = 32`——测试有效，且能定位。
+
+**`fidelity`**：对 13 个目的地采 7 个字段——`feImage` 的 href 哈希、图元盒、`feDisplacementMap[scale]`、`<filter>` 区域、lens 计算样式、装饰画布的 CSS 盒 + transform + blend + display、表面数。先记录，改一处，再比对：
+
+```bash
+node scripts/refraction-probe.mjs fidelity --write=/tmp/base.json
+# ...改一处...
+node scripts/refraction-probe.mjs fidelity --baseline=/tmp/base.json   # 有不一致则 exit 1
+```
+
+两条诚实的边界：
+
+- 它是 **A/B 工具而非门禁**。指纹覆盖位移图的**字节**，同一构建重复跑完全一致（已验证），但它绑在渲染器版本上——浏览器升级后合理变化。所以用法是"记录基线 → 改一处 → 比对"，不是在 CI 里当恒定断言。
+- 画布字段**不含 `canvas.width/height`**。那两个值是**剔除状态**：视口外的面已释放 backing store，而采样瞬间哪些面在视口外取决于帧循环跑到哪里——这被实测到过：同一构建两次运行，102 面的那一页报了不一致。CSS 盒、transform、blend、display 由布局决定、不随剔除移动，所以它们能抓到合成变化而不会连时钟一起抓。活跃画布数作为信息单独打印，**不参与比对**。
+
+`fidelity` 每个目的地起一个**全新浏览器**：复用同一个标签页会在第三、四个页面之后让渲染进程彻底停止应答 `Runtime.evaluate`（手工挂载/卸载几个玻璃页也能复现）。冷启动两秒，相对一页指纹可以忽略。某个目的地失败会被记录、跳过，并让退出码非零——**跳过的目的地不算通过**。
 
 ---
 
