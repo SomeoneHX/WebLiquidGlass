@@ -197,8 +197,19 @@ function svgRoot() {
  * nothing for it (WebKit) still report support. Feature-detecting it properly needs a paint
  * comparison, so the cheap and honest test is the engine itself — every Chromium build since
  * 76 implements it, and no other engine does.
+ *
+ * Memoised: `BackdropEffectScope.lens()` calls this once per frame per surface, and the answer
+ * is a property of the engine, not of the call. Reading `navigator.userAgentData.brands` every
+ * time showed up in the CPU profile of a plain scroll.
  */
+let refractionSupported = null;
 function isRefractionSupported() {
+    if (refractionSupported !== null)
+        return refractionSupported;
+    refractionSupported = detectRefractionSupport();
+    return refractionSupported;
+}
+function detectRefractionSupport() {
     if (typeof navigator === 'undefined')
         return false;
     const brands = navigator
@@ -209,7 +220,27 @@ function isRefractionSupported() {
     return /\b(Chrome|Chromium|Edg|OPR)\//.test(navigator.userAgent);
 }
 const mapCache = new Map();
-const MAP_LIMIT = 32;
+/**
+ * Entries are keyed by `(round(width) × round(height), corner radii, round(refractionHeight),
+ * flags, branch)`, and a single animated call site walks several `refractionHeight` values — a
+ * Toggle press with chromatic aberration alone can want 6 geometries × 3 branches = 18 entries.
+ * At 32 the cache evicted its own working set mid-gesture, so every press re-ran the whole
+ * build + PNG encode instead of hitting. Raising the limit is pure caching: nothing about the
+ * rendered result changes, only whether a rebuild happens. Entries are a few tens of kB each.
+ */
+const MAP_LIMIT = 96;
+/**
+ * Neutral grey = "leave this pixel alone", as one 32-bit word instead of four byte writes per
+ * pixel: the padded region is neutral everywhere except the thin rim band, so the whole bitmap
+ * is a single `fill()` and only the band is ever overwritten. `image.data` is RGBA byte order, so
+ * on a little-endian host byte 0 (R, the low byte) is 0x80 → 0xFF808080. Endianness is read once
+ * rather than assumed.
+ */
+const NEUTRAL_WORD = (() => {
+    const probe = new Uint8Array(4);
+    new Uint32Array(probe.buffer)[0] = 0x01020304;
+    return probe[0] === 0x04 ? 0xff808080 : 0x808080ff;
+})();
 function mapKey(spec, branch) {
     const r = spec.cornerRadii.map((v) => Math.round(v * 2) / 2).join(',');
     const flags = `${spec.depthEffect ? 1 : 0}${spec.chromaticAberration ? 1 : 0}`;
@@ -249,6 +280,34 @@ function clampByte(value) {
     return Math.max(0, Math.min(255, Math.round(value)));
 }
 /**
+ * One reusable canvas for every map build.
+ *
+ * The builds used to allocate a fresh `<canvas>` each time and then encode it with
+ * `toDataURL('image/png')` — a synchronous PNG encode on the main thread. Measured on a 168×152
+ * bitmap (the Toggle thumb's map): ~1 ms on a warm canvas, ~7 ms on a freshly allocated one, and a
+ * single press builds 18 maps, so the allocation was costing more than the encode.
+ *
+ * Nothing about the bitmap changes: every build fills the whole `ImageData`, `putImageData`
+ * overwrites all of it (a resize clears the backing store anyway), and what reaches the filter is
+ * the data URL, not the canvas element.
+ */
+let mapScratch = null;
+/**
+ * Returns the element, not the context: `ctx.canvas` is a back-reference a test double is not
+ * obliged to model, and `scripts/refraction-probe.mjs` evaluates this file in Node against a stub
+ * whose `getContext()` returns only `createImageData` / `putImageData`. Reaching for the element
+ * we already hold keeps the core runnable outside a browser.
+ */
+function mapCanvas(width, height) {
+    if (!mapScratch)
+        mapScratch = document.createElement('canvas');
+    if (mapScratch.width !== width || mapScratch.height !== height) {
+        mapScratch.width = width;
+        mapScratch.height = height;
+    }
+    return mapScratch;
+}
+/**
  * One displacement-map bitmap. `branch` selects the spectral copy: `+1` red (`base·(1+i)`),
  * `0` green (`base`), `-1` blue (`base·(1−i)`). Encoded magnitudes are normalised to the
  * branch's own maximum so the 8-bit channel never clips (red/blue reach `2·base` at a sharp
@@ -259,9 +318,7 @@ function buildMap(spec, branch) {
     const h = Math.max(1, Math.round(spec.height));
     const cw = w + FILTER_PAD * 2;
     const ch = h + FILTER_PAD * 2;
-    const canvas = document.createElement('canvas');
-    canvas.width = cw;
-    canvas.height = ch;
+    const canvas = mapCanvas(cw, ch);
     const ctx = canvas.getContext('2d');
     if (!ctx)
         return { url: '', vmax: 1 };
@@ -277,70 +334,138 @@ function buildMap(spec, branch) {
     /** Rim pixels, collected in pass 1 and encoded in pass 2 once `vmax` is known. */
     const rim = [];
     let vmax = 0;
+    // Neutral grey = "leave this pixel alone".
+    //
+    // The exact zero point is 127.5, not 128: `feDisplacementMap` reads the channel as
+    // value/255 minus 0.5, so a uniform 128 leaves a constant +0.5 LSB on the whole map
+    // (= +scale/510 px of sampling offset toward +x/+y, which reads as the lens drifting
+    // up-left). It is left uncorrected on purpose.
+    //
+    // Measured against a linear-gradient backdrop (24 000 px averaged, ~0.02 px resolution),
+    // what reaches the screen is a whole-pixel staircase, not a drift that grows with the
+    // amount: 0 px up to scale 252, 1 px from 255 to 764, 2 px from 765 — and screenshots on
+    // one plateau are byte-identical. A 1 px checkerboard backdrop keeps its full contrast at
+    // every scale, so the offset is quantised to whole pixels with nearest-neighbour sampling
+    // (Skia's raster path truncates: `srcX = x + SkScalarTruncToInt(displX)`); residue of this
+    // size cannot survive. Dithering the neutral between 127 and 128 cancels the mean only
+    // above scale 510 and converts an invisible whole-pixel offset into per-pixel ±1 px
+    // sampling jitter — noise inside the region that is supposed to be an exact identity.
+    new Uint32Array(data.buffer).fill(NEUTRAL_WORD);
+    /**
+     * Only the rim band is ever non-neutral, and evaluating the SDF is the expensive half of the
+     * build (one `Math.hypot` per pixel, plus four more per rim pixel for the gradient). So the scan
+     * walks only the rows and columns that can hold a rim pixel; the `fill()` above covers the rest.
+     *
+     * The bound comes from `sdf` itself. Writing `p = max(qy, 0)` and `q = max(qx, 0)`, it returns
+     * `hypot(q, p) + min(max(qx,qy), 0) - r`, so a rim pixel (`-bezel <= d <= 0`) must satisfy
+     * `r - bezel <= hypot(q, p) <= r`. Two consequences, and only these two are used:
+     *
+     *  - `p > r` → `d > 0`: the whole row is outside, and rows past the band are skipped outright
+     *    (this is where most of the padding margin is discarded);
+     *  - `p >= r - bezel` → the `q = 0` half satisfies the ring on its own, so the entire side is
+     *    in play (`d` still lands wherever the SDF says, and the rim test below filters it);
+     *  - otherwise the ring restricts `q` to `[sqrt((r-bezel)² - p²), sqrt(r² - p²)]`, i.e. a band
+     *    `r - q` wide at each cap. When `p <= 0` that collapses to `x <= bezel`, the plain
+     *    left/right cap.
+     *
+     * This is a **superset** of the rim: anything admitted here but rejected by the SDF is still
+     * dropped by the same `d > 0 || d < -bezel` test, so the bitmap is bit-identical. The padded
+     * margin is covered too — every pixel outside `[0, w] × [0, h]` has `p > r`, so the bound
+     * excludes it and it keeps its neutral word.
+     *
+     * `centerX` is `w / 2`, so the side split has to be integral: `sdf` branches on `x < cx`, which
+     * for integer `x` means `x <= ceil(cx) - 1` on the left.
+     */
+    const centerX = hw;
+    const centerY = hh;
+    const splitX = Math.ceil(centerX);
     for (let j = 0; j < ch; j++) {
         const y = j - FILTER_PAD;
-        for (let i = 0; i < cw; i++) {
-            const index = (j * cw + i) * 4;
-            // Neutral grey = "leave this pixel alone".
-            //
-            // The exact zero point is 127.5, not 128: `feDisplacementMap` reads the channel as
-            // value/255 minus 0.5, so a uniform 128 leaves a constant +0.5 LSB on the whole map
-            // (= +scale/510 px of sampling offset toward +x/+y, which reads as the lens drifting
-            // up-left). It is left uncorrected on purpose.
-            //
-            // Measured against a linear-gradient backdrop (24 000 px averaged, ~0.02 px resolution),
-            // what reaches the screen is a whole-pixel staircase, not a drift that grows with the
-            // amount: 0 px up to scale 252, 1 px from 255 to 764, 2 px from 765 — and screenshots on
-            // one plateau are byte-identical. A 1 px checkerboard backdrop keeps its full contrast at
-            // every scale, so the offset is quantised to whole pixels with nearest-neighbour sampling
-            // (Skia's raster path truncates: `srcX = x + SkScalarTruncToInt(displX)`); residue of this
-            // size cannot survive. Dithering the neutral between 127 and 128 cancels the mean only
-            // above scale 510 and converts an invisible whole-pixel offset into per-pixel ±1 px
-            // sampling jitter — noise inside the region that is supposed to be an exact identity.
-            data[index] = 128;
-            data[index + 1] = 128;
-            data[index + 2] = 128;
-            data[index + 3] = 255;
-            const x = i - FILTER_PAD;
-            const d = at(x, y);
-            // Only the rim bends: drop everything outside the shape and everything deeper than
-            // `bezel`, which skips the gradient work for the (large) flat centre.
-            if (d > 0 || d < -bezel)
+        const top = y < centerY;
+        const rowBase = j * cw;
+        for (let side = 0; side < 2; side++) {
+            const onLeft = side === 0;
+            // Mirrors `sdf`'s own per-quadrant radius choice, so the bound uses the same `r` it does.
+            const r = onLeft ? (top ? tl : bl) : top ? tr : br;
+            const p = Math.abs(y - centerY) - (centerY - r);
+            if (p > r)
                 continue;
-            // `circleMap` — the shader's `1 - sqrt(1 - x * x)`, a circular sagitta. It rises steeply
-            // only as `x` leaves 0, so the bend stays in a thin band against the rim instead of
-            // spreading across the whole bezel the way a smoothstep would.
-            const t = Math.min(1, Math.max(0, 1 + d / bezel));
-            const falloff = 1 - Math.sqrt(Math.max(0, 1 - t * t));
-            let gx = gradAt(x + 1, y) - gradAt(x - 1, y);
-            let gy = gradAt(x, y + 1) - gradAt(x, y - 1);
-            let length = Math.hypot(gx, gy);
-            if (length > 0) {
-                gx /= length;
-                gy /= length;
+            let from;
+            let to;
+            if (p >= r - bezel) {
+                from = onLeft ? 0 : splitX;
+                // `w + 1`, not `w`: at `x = w` the SDF is exactly `0`, which is still inside the rim test
+                // (`d > 0` is what excludes), so the last column of the box belongs to the band. `x = -1`
+                // needs no such care — there `d > 0` and the rim test drops it anyway.
+                to = onLeft ? splitX : w + 1;
             }
-            if (depth !== 0) {
-                // `grad + depthEffect * normalize(centeredCoord)`, renormalised — the analytic
-                // `gradSdRoundedRect` gradient is unit length, and so is this finite-difference one.
-                const cx = x - hw;
-                const cy = y - hh;
-                const centreLength = Math.hypot(cx, cy);
-                if (centreLength > 0) {
-                    gx += cx / centreLength;
-                    gy += cy / centreLength;
-                    length = Math.hypot(gx, gy);
-                    if (length > 0) {
-                        gx /= length;
-                        gy /= length;
-                    }
+            else if (p <= 0) {
+                // `q >= r - bezel` with `q = r - x` on the left → `x <= bezel`, and symmetrically.
+                const edge = Math.floor(bezel) + 1;
+                if (onLeft) {
+                    from = 0;
+                    to = Math.min(splitX, edge);
+                }
+                else {
+                    from = Math.max(splitX, w - edge);
+                    to = w + 1;
                 }
             }
-            // The shader's `dispersionIntensity` — `chromaticAberration` is baked as the constant 1.
-            const dispersion = ((x - hw) * (y - hh)) / (hw * hh);
-            const m = falloff * (1 + branch * dispersion);
-            if (m > vmax)
-                vmax = m;
-            rim.push({ index, gx, gy, m });
+            else {
+                const inner = (r - bezel) * (r - bezel) - p * p;
+                const lo = inner > 0 ? Math.sqrt(inner) : 0;
+                const hi = Math.sqrt(Math.max(0, r * r - p * p));
+                if (onLeft) {
+                    from = Math.max(0, Math.floor(r - hi));
+                    to = Math.min(splitX, Math.floor(r - lo) + 1);
+                }
+                else {
+                    from = Math.max(splitX, Math.ceil(w - r + lo));
+                    to = Math.min(w + 1, Math.floor(w - r + hi) + 1);
+                }
+            }
+            for (let x = from; x < to; x++) {
+                const index = (rowBase + x + FILTER_PAD) * 4;
+                const d = at(x, y);
+                // Only the rim bends: drop everything outside the shape and everything deeper than
+                // `bezel`, which skips the gradient work for the (large) flat centre.
+                if (d > 0 || d < -bezel)
+                    continue;
+                // `circleMap` — the shader's `1 - sqrt(1 - x * x)`, a circular sagitta. It rises steeply
+                // only as `x` leaves 0, so the bend stays in a thin band against the rim instead of
+                // spreading across the whole bezel the way a smoothstep would.
+                const t = Math.min(1, Math.max(0, 1 + d / bezel));
+                const falloff = 1 - Math.sqrt(Math.max(0, 1 - t * t));
+                let gx = gradAt(x + 1, y) - gradAt(x - 1, y);
+                let gy = gradAt(x, y + 1) - gradAt(x, y - 1);
+                let length = Math.hypot(gx, gy);
+                if (length > 0) {
+                    gx /= length;
+                    gy /= length;
+                }
+                if (depth !== 0) {
+                    // `grad + depthEffect * normalize(centeredCoord)`, renormalised — the analytic
+                    // `gradSdRoundedRect` gradient is unit length, and so is this finite-difference one.
+                    const cx = x - hw;
+                    const cy = y - hh;
+                    const centreLength = Math.hypot(cx, cy);
+                    if (centreLength > 0) {
+                        gx += cx / centreLength;
+                        gy += cy / centreLength;
+                        length = Math.hypot(gx, gy);
+                        if (length > 0) {
+                            gx /= length;
+                            gy /= length;
+                        }
+                    }
+                }
+                // The shader's `dispersionIntensity` — `chromaticAberration` is baked as the constant 1.
+                const dispersion = ((x - hw) * (y - hh)) / (hw * hh);
+                const m = falloff * (1 + branch * dispersion);
+                if (m > vmax)
+                    vmax = m;
+                rim.push({ index, gx, gy, m });
+            }
         }
     }
     const k = vmax > 0 ? 127 / vmax : 0;
@@ -387,9 +512,7 @@ function buildZoomMap(width, height, zoom) {
     const h = Math.max(1, Math.round(height));
     const cw = w + FILTER_PAD * 2;
     const ch = h + FILTER_PAD * 2;
-    const canvas = document.createElement('canvas');
-    canvas.width = cw;
-    canvas.height = ch;
+    const canvas = mapCanvas(cw, ch);
     const ctx = canvas.getContext('2d');
     if (!ctx)
         return { url: '', vmax: 1 };
@@ -411,21 +534,15 @@ function buildZoomMap(width, height, zoom) {
             vmax = magnitude;
     }
     const s = vmax > 0 ? 127 / vmax : 0;
-    for (let j = 0; j < ch; j++) {
-        const y = j - FILTER_PAD;
-        for (let i = 0; i < cw; i++) {
-            const x = i - FILTER_PAD;
-            const index = (j * cw + i) * 4;
-            // Neutral grey — same 127.5-vs-128 zero point as `buildMap`, same deliberate choice.
-            data[index] = 128;
-            data[index + 1] = 128;
-            data[index + 2] = 128;
-            data[index + 3] = 255;
-            if (x < 0 || x >= w || y < 0 || y >= h)
-                continue;
-            const dx = cx + (x - cx) / k - x;
-            const dy = cy + (y - cy) / k - y;
-            data[index] = clampByte(128 + dx * s);
+    // Neutral grey — same 127.5-vs-128 zero point as `buildMap`, same deliberate choice, and the
+    // same single-word fill: the field is only non-neutral inside the element box.
+    new Uint32Array(data.buffer).fill(NEUTRAL_WORD);
+    for (let y = 0; y < h; y++) {
+        const rowBase = (y + FILTER_PAD) * cw + FILTER_PAD;
+        const dy = cy + (y - cy) / k - y;
+        for (let x = 0; x < w; x++) {
+            const index = (rowBase + x) * 4;
+            data[index] = clampByte(128 + (cx + (x - cx) / k - x) * s);
             data[index + 1] = clampByte(128 + dy * s);
         }
     }
@@ -526,6 +643,16 @@ function createGlassFilter() {
     /** The capture overlay (static image composited into the capture), when present. */
     let overlayImageEl = null;
     let lastOverlayUrl = null;
+    /** The overlay placement last written — `x`/`y` move every frame, `width`/`height` do not. */
+    let lastOverlayPlacement = '';
+    /**
+     * Per displacement node: the `scale` string last written. `update()` runs on **every** redraw,
+     * including every frame of a scroll, and a scroll changes none of the inputs `scale` is built
+     * from — so the same string was being written to the same node again and again. Writing an
+     * attribute on an SVG filter primitive marks the filter dirty, which is what makes it cheap to
+     * write and expensive to have written. Skipping the identical write is the whole fix.
+     */
+    let lastScales = [];
     function buildGraph(ca, zoom, overlay) {
         while (filter.firstChild)
             filter.removeChild(filter.firstChild);
@@ -538,6 +665,8 @@ function createGlassFilter() {
         zoomKey = null;
         overlayImageEl = null;
         lastOverlayUrl = null;
+        lastOverlayPlacement = '';
+        lastScales = [];
         // The zoom stage samples with its own fixed scale, and the refraction chain refracts the
         // already-magnified image — the original's `onDrawBackdrop`-then-effects order.
         let chainInput = 'SourceGraphic';
@@ -639,13 +768,16 @@ function createGlassFilter() {
                     zoomDisplacement.setAttribute('scale', String(entry.vmax * 2));
                 }
             }
+            // One resolution per branch per update: `maps` and `displacements` are index-aligned with
+            // `branches`, so the `href`s and the `scale`s are read off the same entries.
+            const branches = ca ? [1, 0, -1] : [0];
+            const entries = branches.map((branch) => refractionMap(spec, branch));
             const key = mapKey(spec, ca ? 1 : 0);
             if (key !== lastMapKey) {
                 lastMapKey = key;
                 // Red and blue share the green branch's geometry, so one key guards all three hrefs.
-                const branches = ca ? [1, 0, -1] : [0];
                 maps.forEach((map, index) => {
-                    const entry = refractionMap(spec, branches[index]);
+                    const entry = entries[index];
                     if (entry.url && mapKeys[index] !== key) {
                         mapKeys[index] = key;
                         map.setAttribute('href', entry.url);
@@ -656,23 +788,34 @@ function createGlassFilter() {
             // slides over a fixed strip) — a cheap attribute write, no image rebuild. `href`
             // only changes when the strip's content does.
             if (hasOverlay && overlayImageEl && overlay) {
-                overlayImageEl.setAttribute('x', String(overlay.x));
-                overlayImageEl.setAttribute('y', String(overlay.y));
-                overlayImageEl.setAttribute('width', String(overlay.width));
-                overlayImageEl.setAttribute('height', String(overlay.height));
+                const placement = `${overlay.x}|${overlay.y}|${overlay.width}|${overlay.height}`;
+                if (placement !== lastOverlayPlacement) {
+                    lastOverlayPlacement = placement;
+                    overlayImageEl.setAttribute('x', String(overlay.x));
+                    overlayImageEl.setAttribute('y', String(overlay.y));
+                    overlayImageEl.setAttribute('width', String(overlay.width));
+                    overlayImageEl.setAttribute('height', String(overlay.height));
+                }
                 if (overlay.url !== lastOverlayUrl) {
                     lastOverlayUrl = overlay.url;
                     overlayImageEl.setAttribute('href', overlay.url);
                 }
             }
-            // Set every frame — `amount` is the animation knob and changes independently of the
-            // map geometry. The map encodes magnitudes normalised to `vmax`; the branch's own
-            // scale factor restores them. `feDisplacementMap` offsets by
-            // `scale * (channel/255 - 0.5)`, so `amount * vmax` is that branch's largest shift, px.
-            const branches = ca ? [1, 0, -1] : [0];
+            // `amount` is the animation knob and changes independently of the map geometry. The map
+            // encodes magnitudes normalised to `vmax`; the branch's own scale factor restores them.
+            // `feDisplacementMap` offsets by `scale * (channel/255 - 0.5)`, so `amount * vmax` is that
+            // branch's largest shift, px.
+            //
+            // Skipped when the value is unchanged. A scroll changes none of the inputs this is built
+            // from, so the identical string used to be re-written to every node on every frame — and an
+            // attribute write on a filter primitive dirties the filter, which is what turns a cheap
+            // write into an expensive re-rasterisation.
             displacements.forEach((displace, index) => {
-                const entry = refractionMap(spec, branches[index]);
-                displace.setAttribute('scale', String(amount * 2 * entry.vmax));
+                const next = String(amount * 2 * entries[index].vmax);
+                if (lastScales[index] === next)
+                    return;
+                lastScales[index] = next;
+                displace.setAttribute('scale', next);
             });
         },
         dispose() {

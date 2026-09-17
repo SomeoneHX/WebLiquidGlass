@@ -249,6 +249,84 @@ function withAlpha(color: string, alpha: number): string {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`
 }
 
+/** Stable identity for a `Shape` object, so it can take part in a string signature. */
+const shapeIds = new WeakMap<object, number>()
+let shapeIdSeq = 0
+function shapeIdOf(shape: Shape): number {
+  let id = shapeIds.get(shape)
+  if (id === undefined) {
+    id = ++shapeIdSeq
+    shapeIds.set(shape, id)
+  }
+  return id
+}
+
+/**
+ * Style writes, de-duplicated.
+ *
+ * `applyLensStyle()` runs on every redraw — including every frame of a scroll — and most of what
+ * it writes is unchanged each time: the transform only moves when a `layerBlock` deforms, the
+ * `clip-path` only changes with the size, the `backdrop-filter` only when `effects { }` reads a
+ * different value. An identical declaration still costs a style invalidation, so the last value is
+ * remembered and the write is skipped. `''` means "not set" and removes the property.
+ */
+let lastStyle: Record<string, string | undefined> = {}
+function setStyle(el: HTMLElement, property: string, value: string): void {
+  if (lastStyle[property] === value) return
+  lastStyle[property] = value
+  if (value) el.style.setProperty(property, value)
+  else el.style.removeProperty(property)
+}
+
+/** `Shape.clipPath` builds a path string; the result only depends on the shape and the box. */
+let clipShape: Shape | null = null
+let clipKey = ''
+let clipValue = ''
+function clipPathFor(shape: Shape, width: number, height: number): string {
+  const key = `${width}x${height}`
+  if (clipShape !== shape || clipKey !== key) {
+    clipShape = shape
+    clipKey = key
+    clipValue = shape.clipPath(width, height)
+  }
+  return clipValue
+}
+
+/**
+ * Everything the three decoration canvases are painted from, as one string.
+ *
+ * They are drawn in **element-local** space and none of their inputs is a function of where the
+ * surface sits on the viewport, so a viewport move — which is every frame of a scroll — must not
+ * repaint them. `animationRevision` is part of the signature because it is the project's contract
+ * for "state that an `effects { }` / highlight / `onDrawSurface` closure reads has changed" (see
+ * the file header): every `Animatable` bumps it, and `InteractiveHighlight` — the only decoration
+ * whose drawing depends on hidden mutable state — is built entirely out of `Animatable`s.
+ */
+function paintSignature(): string {
+  const t = currentTransform()
+  const o = currentOffset()
+  const h = currentHighlight()
+  const s = currentShadow()
+  const inner = props.innerShadow?.() ?? null
+  const parts: string[] = [
+    String(animationRevision.value),
+    `${size.value.width}x${size.value.height}`,
+    String(shapeIdOf(props.shape)),
+    `t${t.translationX},${t.translationY},${t.scaleX},${t.scaleY},${t.rotationZ},${t.alpha}`,
+    `o${o.x},${o.y}`,
+    h
+      ? `h${h.style},${h.width},${h.blurRadius},${h.alpha},${h.colorAlpha},${h.angle},${h.falloff},${h.additive}`
+      : 'h-',
+    s ? `s${s.radius},${s.offsetX},${s.offsetY},${s.color},${s.alpha}` : 's-',
+    inner ? `i${inner.radius},${inner.offsetX},${inner.offsetY},${inner.color},${inner.alpha}` : 'i-',
+    props.onDrawSurface ? 'wash' : '-',
+    props.interactiveHighlight ? 'press' : '-',
+    props.captureOverlay?.() ? 'capture' : '-',
+    props.backdropZoom?.() ? 'zoom' : '-'
+  ]
+  return parts.join('|')
+}
+
 function applyLensStyle(): void {
   const el = lensEl.value
   const width = size.value.width
@@ -256,15 +334,15 @@ function applyLensStyle(): void {
   if (!el || width <= 0 || height <= 0) return
 
   const transform = currentCssTransform()
-  el.style.transform = transform === 'none' ? '' : transform
-  el.style.transformOrigin = 'center'
+  setStyle(el, 'transform', transform === 'none' ? '' : transform)
+  setStyle(el, 'transform-origin', 'center')
   const alpha = currentTransform().alpha
-  el.style.opacity = alpha === 1 ? '' : String(alpha)
-  el.style.clipPath = props.shape.clipPath(width, height)
+  setStyle(el, 'opacity', alpha === 1 ? '' : String(alpha))
+  setStyle(el, 'clip-path', clipPathFor(props.shape, width, height))
 
   if (!props.backdrop.samples) {
-    el.style.backdropFilter = ''
-    el.style.removeProperty('-webkit-backdrop-filter')
+    setStyle(el, 'backdrop-filter', '')
+    setStyle(el, '-webkit-backdrop-filter', '')
     return
   }
 
@@ -279,19 +357,19 @@ function applyLensStyle(): void {
   if (alphaMask) {
     const intensity = alphaMask.floats.get('tintIntensity')?.[0] ?? 0.8
     const tint = alphaMask.colors.get('tint')
-    el.style.setProperty('-webkit-mask-image', ALPHA_MASK_GRADIENT)
-    el.style.setProperty('mask-image', ALPHA_MASK_GRADIENT)
-    el.style.backgroundColor = tint ? withAlpha(tint, intensity) : ''
+    setStyle(el, '-webkit-mask-image', ALPHA_MASK_GRADIENT)
+    setStyle(el, 'mask-image', ALPHA_MASK_GRADIENT)
+    setStyle(el, 'background-color', tint ? withAlpha(tint, intensity) : '')
   } else {
-    el.style.removeProperty('-webkit-mask-image')
-    el.style.removeProperty('mask-image')
-    el.style.backgroundColor = ''
+    setStyle(el, '-webkit-mask-image', '')
+    setStyle(el, 'mask-image', '')
+    setStyle(el, 'background-color', '')
   }
 
   const refraction = effectScope.refraction
   if (!refraction || !glassFilter) {
-    el.style.backdropFilter = base
-    el.style.setProperty('-webkit-backdrop-filter', base)
+    setStyle(el, 'backdrop-filter', base)
+    setStyle(el, '-webkit-backdrop-filter', base)
     return
   }
 
@@ -313,8 +391,8 @@ function applyLensStyle(): void {
   // no-op `blur(0px)` prefix (the magnifier lens has no blur/vibrancy of its own; without
   // the prefix its entire filter graph never runs, with no console error).
   const value = `${base || 'blur(0px)'} url(#${glassFilter.id})`
-  el.style.backdropFilter = value
-  el.style.setProperty('-webkit-backdrop-filter', value)
+  setStyle(el, 'backdrop-filter', value)
+  setStyle(el, '-webkit-backdrop-filter', value)
 }
 
 /**
@@ -384,8 +462,18 @@ function redraw() {
         canvas.height = 0
       }
     }
+    // The backing stores are gone, so whenever this surface comes back it must paint in full.
+    lastPaintSignature = null
+    lastPaintedVisible = false
     return
   }
+
+  // The lens style above is cheap (every write in it is skipped when unchanged); the three canvas
+  // paints are not, and a scroll changes nothing they depend on. See `paintSignature`.
+  const signature = paintSignature()
+  if (visible === lastPaintedVisible && signature === lastPaintSignature) return
+  lastPaintSignature = signature
+  lastPaintedVisible = true
 
   paintCanvas(shadowCanvasEl.value, overflow.value, (ctx) => {
     drawGlassShadow(ctx, {
@@ -420,6 +508,10 @@ function redraw() {
     })
   })
 }
+
+/** Signature of the last full canvas paint, and whether that paint was for a visible surface. */
+let lastPaintSignature: string | null = null
+let lastPaintedVisible = false
 
 function scheduleRedraw() {
   if (pending) return
