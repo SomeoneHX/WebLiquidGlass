@@ -314,7 +314,7 @@ apply(document.querySelector('.header'), { blur: 12, refractionAmount: 30 })
 // <script src="https://someonehx.github.io/WebLiquidGlass/liquid-glass-refract.user.js"></script>
 ```
 
-脚本**默认不做任何事**（没有配置就不扫描、不修改任何元素），所以 `@require` 进来是安全的；重复引入会被自身的加载守卫忽略，不会重复绑监听。
+脚本**默认不做任何事**（没有配置就不扫描、不修改任何元素），所以 `@require` 进来是安全的；重复引入会被自身的加载守卫忽略，不会重复绑监听。它同时也是**拼接安全**的（首尾各有分号守卫，理由见 §10.6）。
 
 ### 10.3 配置：在执行脚本前赋值 `window.LiquidGlassRefractConfig`
 
@@ -365,7 +365,7 @@ window.LiquidGlassRefractConfig = {
 ### 10.6 生成、校验与发布
 
 ```bash
-npm run check:userscript    # node --check 语法校验
+npm run check:userscript    # 语法 + 拼接安全 + 版本一致性（见下）
 npm run stage:userscript    # 本地按 CI 的方式打版输出到 dist/liquid-glass-refract.user.js
 npm run dev                 # 浏览器里验证（把脚本粘进测试页即可，见下）
 ```
@@ -386,7 +386,14 @@ npm run dev                 # 浏览器里验证（把脚本粘进测试页即�
 
 ⚠️ **核心不许依赖 `ctx.canvas`**：`probe:map` 会在 Node 里用一套假 DOM 求值第 1 段，其假 canvas 的 `getContext()` 只提供 `createImageData` / `putImageData`，**没有 `canvas` 反向引用**。曾经为了复用画布写成 `ctx.canvas.toDataURL(...)`，直接把 `npm run probe:map` 打挂（`TypeError: ... reading 'toDataURL'`）。正确做法是让 helper 返回**元素本身**，而不是绕道 `ctx`。
 
-脚本内只有**一行**与提取源不同：`svgRoot()` 里 `document.body || document.documentElement`，以便在 `<body>` 存在之前执行（`@require` 就是这种情况）。
+第 1 段内只有**一行**与提取源不同：`svgRoot()` 里 `document.body || document.documentElement`，以便在 `<body>` 存在之前执行（`@require` 就是这种情况）。
+
+**拼接安全靠两处分号守卫**，它们在第 1 段之外的头部/尾部，重新同步不会碰到：
+
+- **开头**：整个脚本是一个 IIFE，而它的第一个 token 是 `(` —— 这正是 ASI **不会**与上一行分开的那一类。上一行若是 `someCall()`，会被解析成 `someCall()(function () { … })()`，把返回值当函数调用。所以文件里写的是 `;(function () {`。
+- **结尾**：`})()` 后面必须带分号，否则紧跟其后、以 `(` 开头的语句会被它吞掉。
+
+这两种合并**在语法上都是合法的**——`node --check` 与任何解析器都分不出来，只有源码文本能。所以 `npm run check:userscript`（`scripts/check-userscript.mjs`）是按**文本**断言这两处，并顺带校验 `@version` 与 `const VERSION` 一致。
 
 ### 10.7 实测数据（无头 Chromium，320×180 / r=28 / refractionHeight=22）
 

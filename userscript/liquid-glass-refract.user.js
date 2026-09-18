@@ -87,7 +87,19 @@
  *   `probeMapSupport()` below exists precisely because of this — it detects the refusal, stops
  *   paying for maps that cannot load, and warns once with the reason.
  */
-(function () {
+/*
+ * Two semicolons in this file are load-bearing, and neither shows up in a test of this file alone.
+ *
+ * The script is meant to be *concatenated*, not merely installed: `@require` splices it into
+ * whatever the manager's wrapper already holds, and userscripts in the wild are routinely pasted
+ * after other code. A statement that begins with `(` is exactly the token ASI will not separate
+ * from a previous line — `someCall()` directly above would parse as
+ * `someCall()(function () { ... })()`, calling the return value. The mirror image applies at the
+ * other end: an unterminated `})()` swallows a following statement that starts with `(`.
+ *
+ * So the IIFE opens with `;` and the file closes with `;)`. If you moved either one, put it back.
+ */
+;(function () {
   'use strict'
 
   /* ==========================================================================================
@@ -1725,4 +1737,4 @@ if (document.readyState === 'loading') {
   if (CONFIG.autoWatch) startWatching()
 }
 bindHotkeys(CONFIG.hotkeys)
-})()
+})();

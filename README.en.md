@@ -314,7 +314,7 @@ apply(document.querySelector('.header'), { blur: 12, refractionAmount: 30 })
 // <script src="https://someonehx.github.io/WebLiquidGlass/liquid-glass-refract.user.js"></script>
 ```
 
-The script **does nothing by default** (with no config it scans nothing and touches no element), so `@require`-ing it is safe; a second inclusion is ignored by its own load guard and will not double-bind listeners.
+The script **does nothing by default** (with no config it scans nothing and touches no element), so `@require`-ing it is safe; a second inclusion is ignored by its own load guard and will not double-bind listeners. It is also **concatenation-safe** — a semicolon guards each end, for the reasons in §10.6.
 
 ### 10.3 Configuration: assign `window.LiquidGlassRefractConfig` before the script runs
 
@@ -365,7 +365,7 @@ Options accepted by `apply`:
 ### 10.6 Generating, checking and releasing
 
 ```bash
-npm run check:userscript    # node --check syntax validation
+npm run check:userscript    # syntax + concatenation safety + version agreement (see below)
 npm run stage:userscript    # stamp and write dist/liquid-glass-refract.user.js the way CI does
 npm run dev                 # verify in a browser (paste the script into a test page, see below)
 ```
@@ -386,7 +386,14 @@ Afterwards, always run: `npm run check:userscript` + `npm run probe:band` + `npm
 
 ⚠️ **The core must not depend on `ctx.canvas`**: `probe:map` evaluates section 1 in Node against a fake DOM whose canvas `getContext()` provides **only** `createImageData` / `putImageData`, with **no `canvas` back-reference**. Reusing the map canvas once produced `ctx.canvas.toDataURL(...)`, which killed `npm run probe:map` outright (`TypeError: ... reading 'toDataURL'`). The fix is to return the **element itself** from the helper rather than going through `ctx`.
 
-Only **one line** in the script differs from the extraction source: `document.body || document.documentElement` in `svgRoot()`, so it can run before `<body>` exists (which is the case for `@require`).
+Only **one line** inside section 1 differs from the extraction source: `document.body || document.documentElement` in `svgRoot()`, so it can run before `<body>` exists (which is the case for `@require`).
+
+**Concatenation safety rests on two semicolons**, both in the hand-maintained head/tail outside section 1, so re-syncing never touches them:
+
+- **Front**: the whole script is one IIFE and its first token is `(` — precisely the token ASI will *not* separate from the line above. If the preceding line is `someCall()`, the two parse as `someCall()(function () { … })()`, calling the return value. The file therefore opens with `;(function () {`.
+- **Back**: the closing `})()` must be terminated, or a statement following it that begins with `(` is absorbed into it.
+
+Both merges are **syntactically valid** — `node --check`, and any parser, cannot tell them apart; only the source text can. `npm run check:userscript` (`scripts/check-userscript.mjs`) therefore asserts those two spots **textually**, and checks that `@version` and `const VERSION` agree.
 
 ### 10.7 Measured data (headless Chromium, 320×180 / r=28 / refractionHeight=22)
 
