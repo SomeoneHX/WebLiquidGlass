@@ -1,5 +1,5 @@
 import type { Size } from './geometry'
-import { isRefractionSupported } from './glass-filter'
+import { isRefractionSupported, type SdfSource } from './glass-filter'
 
 /**
  * Port of `com.kyant.backdrop.BackdropEffectScope`, plus the `Backdrop` marker.
@@ -17,7 +17,8 @@ import { isRefractionSupported } from './glass-filter'
  * | `blur(radius)` → `BlurEffect` | `blurRadius` → `backdrop-filter: blur()` |
  * | `vibrancy()` / `colorControls()` | `saturation` / `brightness` / `contrast` |
  * | `lens(h, a)` → AGSL refraction shader | `refraction` → SVG `feDisplacementMap` |
- * | `runtimeShaderEffect` / `sdfTexture` | not expressible in CSS — recorded, inert |
+ * | `sdfTexture(h, a)` → `SdfShader` | `sdf` → `feDisplacementMap` over the decoded field, plus `mask-image` and a bevel multiplier |
+ * | `runtimeShaderEffect` | no CSS twin — recorded, inert; specific shaders are re-expressed by hand (`AlphaMask`) |
  * | `innerShadow` (a RenderEffect) | still canvas-drawn, unchanged |
  *
  * The call sites keep writing 1:1 Kotlin, so the numbers in `views/` and `components/` still
@@ -32,6 +33,23 @@ export interface RefractionRequest {
   refractionAmount: number
   depthEffect: boolean
   chromaticAberration: boolean
+}
+
+/**
+ * `SdfShader.apply(refractionHeight, lightAngle)` — refraction of a **baked** distance field
+ * rather than of a rounded rect (the lock screen's clock face).
+ *
+ * Upstream the texture is a field of the `SdfShader` object and the call reads
+ * `with(sdfShader) { apply() }`. There is no shader object to hold it here, so the decoded texture
+ * arrives as an extra argument — the one place this port's signature is not 1:1 with Kotlin, and
+ * it is flagged at the call site too.
+ */
+export interface SdfRequest {
+  /** `apply(refractionHeight)` — the displacement scale, since the field itself is baked. */
+  refractionHeight: number
+  /** `apply(lightAngle)` — bevel light angle in degrees. */
+  lightAngle: number
+  texture: SdfSource
 }
 
 /**
@@ -67,6 +85,8 @@ export class BackdropEffectScope {
   saturation = 1
   /** `lens(...)`, or `null` when the platform cannot refract. */
   refraction: RefractionRequest | null = null
+  /** `SdfShader.apply(...)` — baked-texture refraction, or `null` when not requested. */
+  sdf: SdfRequest | null = null
   /** Recorded for the web re-expressions of specific shaders (`AlphaMask`). */
   readonly shaderRequests: RecordedShader[] = []
 
@@ -77,6 +97,7 @@ export class BackdropEffectScope {
     this.contrast = 1
     this.saturation = 1
     this.refraction = null
+    this.sdf = null
     this.shaderRequests.length = 0
   }
 
@@ -137,11 +158,22 @@ export class BackdropEffectScope {
     this.shaderRequests.push(record)
   }
 
-  /** `SdfShader.apply()` — the lock-screen clock texture. */
-  sdfTexture(refractionHeight: number, lightAngle: number): void {
-    void refractionHeight
-    void lightAngle
-    this.shaderRequests.push({ key: 'SdfShader', floats: new Map(), colors: new Map() })
+  /**
+   * `SdfShader.apply(refractionHeight, lightAngle)`.
+   *
+   * The texture is an explicit third argument, and that is the only signature in this file that
+   * is not 1:1 with Kotlin — upstream the texture is a field of the `SdfShader` receiver, and
+   * there is no receiver to close over here.
+   *
+   * Unlike `runtimeShaderEffect`, this one *is* expressible: `feDisplacementMap` over a field
+   * decoded from the same texture reproduces the displacement, the texture's alpha channel
+   * reproduces `content.eval(...) * v.a` as a `mask-image`, and the bevel tail collapses into one
+   * multiplier. So with a texture the request is live, and without one there is nothing to
+   * record — a clock with no face is not a degraded clock, it is an empty screen.
+   */
+  sdfTexture(refractionHeight: number, lightAngle: number, texture?: SdfSource | null): void {
+    if (!texture) return
+    this.sdf = { refractionHeight, lightAngle, texture }
   }
 
   /** `backdrop-filter` value, e.g. `blur(8px) saturate(150%) brightness(1.05)`. */
@@ -152,6 +184,23 @@ export class BackdropEffectScope {
     if (this.brightness !== 1) parts.push(`brightness(${round(this.brightness * 100)}%)`)
     if (this.contrast !== 1) parts.push(`contrast(${round(this.contrast * 100)}%)`)
     return parts.join(' ')
+  }
+
+  /**
+   * Just the blur — the colour functions are split off for callers that move them into the SVG
+   * filter instead.
+   *
+   * Two reasons to prefer the filter. `brightness` upstream is an **additive offset**
+   * (`ColorFilter.kt`: `t = (0.5f − c·0.5f + brightness) · 255f`, i.e. it lands in the constant
+   * column of the colour matrix), and CSS `brightness()` is a multiply — at `−0.1` that is 25.5 of
+   * constant difference, which lifts every dark channel and greys out saturated glass. And a flat
+   * wash drawn inside the filter only rides along with `saturate` / `contrast` if the matrix sits
+   * *after* it, which CSS cannot arrange, because CSS runs its functions before `url(#…)`.
+   *
+   * See `RefractionSpec.colorControls`.
+   */
+  blurCss(): string {
+    return this.blurRadius > 0 ? `blur(${round(this.blurRadius)}px)` : ''
   }
 }
 

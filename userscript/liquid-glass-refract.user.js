@@ -160,6 +160,26 @@
  * `1f`), so the dispersion field depends only on geometry and bakes into the maps; the
  * animation knob stays `refractionAmount`, which every branch is linear in.
  *
+ * ## SDF text (`SdfShader`)
+ *
+ * `LockScreenContent` refracts a *baked* field rather than a rounded rect. `clock_sdf` is a
+ * 1599×515 texture whose channels are a signed distance, its unit normal and a coverage mask, and
+ * the Android build hands it to a runtime shader. Nothing about the map format changes here — the
+ * only difference is where the distance and its normal come from. `buildSdfMap` is `buildMap` with
+ * a different field source and the same encoder, the same cache, the same `scale` knob.
+ *
+ * Two things the shader does that `feDisplacementMap` cannot, and what stands in for each:
+ *
+ *  - `content.eval(refractedCoord) * v.a` masks the result by the shape's coverage. The lens
+ *    element already carries a `mask-image` for the `AlphaMask` shader, and this texture's alpha
+ *    channel *is* a coverage mask, so the same mechanism takes it (`GlassSurface`).
+ *  - the bevel tail is two `color *= 1 + k` applications. Both collapse into one multiplier
+ *    `1 + α`, baked to an image and applied with `feComposite arithmetic k1 = k3 = 1` — see
+ *    `buildBevelMap`.
+ *
+ * Decoding is not here: this module takes texels, never a URL, so it stays evaluable outside a
+ * browser and liftable into the userscript unchanged.
+ *
  * ## Chromium-only
  *
  * `url()` inside `backdrop-filter` is a Chromium extension (Chrome / Edge 76+). Safari and
@@ -241,7 +261,24 @@ const NEUTRAL_WORD = (() => {
     new Uint32Array(probe.buffer)[0] = 0x01020304;
     return probe[0] === 0x04 ? 0xff808080 : 0x808080ff;
 })();
+/**
+ * Opaque black, for the bevel map's "no brightening" fill. Alpha must be 1 rather than 0:
+ * `feComposite` composites premultiplied values, and a transparent pixel would make the whole
+ * `map × color` term vanish instead of evaluating to zero. Endianness read the same way.
+ */
+const OPAQUE_BLACK_WORD = (() => {
+    const probe = new Uint8Array(4);
+    new Uint32Array(probe.buffer)[0] = 0x01020304;
+    return probe[0] === 0x04 ? 0xff000000 : 0x000000ff;
+})();
 function mapKey(spec, branch) {
+    // The SDF field is baked into the texture, so neither `refractionHeight` (a scale) nor
+    // `lightAngle` (bevel only) can change it — only the box and the texture can. Keeping the
+    // rounded-rect key shape here would rebuild the bitmap on every step of an animation that
+    // is supposed to be a pure `scale` write.
+    if (spec.sdf) {
+        return `sdf|${Math.round(spec.width)}x${Math.round(spec.height)}|${spec.sdf.key}|${branch}`;
+    }
     const r = spec.cornerRadii.map((v) => Math.round(v * 2) / 2).join(',');
     const flags = `${spec.depthEffect ? 1 : 0}${spec.chromaticAberration ? 1 : 0}`;
     return `${Math.round(spec.width)}x${Math.round(spec.height)}|${r}|${Math.round(spec.refractionHeight)}|${flags}|${branch}`;
@@ -491,7 +528,250 @@ function refractionMap(spec, branch) {
     const hit = mapCache.get(key);
     if (hit !== undefined)
         return hit;
-    const entry = buildMap(spec, branch);
+    const entry = spec.sdf ? buildSdfMap(spec, branch) : buildMap(spec, branch);
+    if (mapCache.size >= MAP_LIMIT) {
+        const oldest = mapCache.keys().next().value;
+        if (oldest !== undefined)
+            mapCache.delete(oldest);
+    }
+    if (entry.url)
+        mapCache.set(key, entry);
+    return entry;
+}
+/* ------------------------------------------------------------------------------------------- */
+/* SDF texture field                                                                             */
+/* ------------------------------------------------------------------------------------------- */
+/**
+ * Normal of the last {@link sdfIntensity} call. Sibling out-params rather than a tuple: this runs
+ * once per texel of every map build and allocating a result object there is the one thing in the
+ * loop that is not arithmetic.
+ */
+let sdfNx = 0;
+let sdfNy = 0;
+/**
+ * One tap of a baked SDF texture, decoded exactly as `SdfShaderString` decodes it, with the
+ * bilinear filtering the GPU would have done (`sdfTex.eval` samples texel centres, so the four
+ * neighbours sit around `p − 0.5`; the border clamps rather than repeating, matching the
+ * shader's own bounds check).
+ *
+ * Returns the shader's `intensity`, and `0` for every texel it discards with
+ * `if (v.a <= 0.0) return half4(0.0)` — outside the shape there is nothing to bend and, for the
+ * bevel map, nothing to light. The normal comes back through {@link sdfNx} / {@link sdfNy}.
+ *
+ * The `<< 2` and `/ 255` are the shader's `* 2.0 − 1.0` remap; `a < 255` is its
+ * `if (v.a < 1.0) sd = 0.0`, which is what puts the *maximum* bend on the anti-aliased boundary
+ * rather than a vanishing one.
+ */
+function sdfIntensity(sdf, tx, ty) {
+    const x0 = Math.floor(tx);
+    const y0 = Math.floor(ty);
+    const fx = tx - x0;
+    const fy = ty - y0;
+    const lastX = sdf.width - 1;
+    const lastY = sdf.height - 1;
+    const ax = x0 < 0 ? 0 : x0 > lastX ? lastX : x0;
+    const bx = x0 + 1 < 0 ? 0 : x0 + 1 > lastX ? lastX : x0 + 1;
+    const ay = y0 < 0 ? 0 : y0 > lastY ? lastY : y0;
+    const by = y0 + 1 < 0 ? 0 : y0 + 1 > lastY ? lastY : y0 + 1;
+    const src = sdf.data;
+    const rowA = ay * sdf.width;
+    const rowB = by * sdf.width;
+    const i00 = (rowA + ax) << 2;
+    const i10 = (rowA + bx) << 2;
+    const i01 = (rowB + ax) << 2;
+    const i11 = (rowB + bx) << 2;
+    const w00 = (1 - fx) * (1 - fy);
+    const w10 = fx * (1 - fy);
+    const w01 = (1 - fx) * fy;
+    const w11 = fx * fy;
+    const a = src[i00 + 3] * w00 + src[i10 + 3] * w10 + src[i01 + 3] * w01 + src[i11 + 3] * w11;
+    // `smoothstep(0.5, 1.0, v.a)` is zero at or below half coverage, and `if (v.a < 1.0) sd = 0.0`
+    // makes the partial band the *strongest* bend — so outside the shape stop here, and inside the
+    // ramp take `sd = 0` (intensity 1) rather than interpolating a distance that is not meaningful
+    // at a sub-texel edge.
+    if (a <= 127.5)
+        return 0;
+    const r = src[i00] * w00 + src[i10] * w10 + src[i01] * w01 + src[i11] * w11;
+    const g = src[i00 + 1] * w00 + src[i10 + 1] * w10 + src[i01 + 1] * w01 + src[i11 + 1] * w11;
+    const b = src[i00 + 2] * w00 + src[i10 + 2] * w10 + src[i01 + 2] * w01 + src[i11 + 2] * w11;
+    const sd = a < 254.5 ? 0 : (r / 255) * 2 - 1;
+    let nx = (g / 255) * 2 - 1;
+    let ny = (b / 255) * 2 - 1;
+    const length = Math.hypot(nx, ny);
+    if (length > 0) {
+        nx /= length;
+        ny /= length;
+    }
+    else {
+        nx = 0;
+        ny = 0;
+    }
+    sdfNx = nx;
+    sdfNy = ny;
+    // `circleMap(1.0 - min(1.0, -sd * 1.5))` — the band is the *inside* of the shape within
+    // `1/1.5 = 2/3` of the distance range, which is the same rim-band-on-the-inside shape the
+    // rounded-rect map produces from its own `bezel`.
+    const t = 1 - Math.min(1, Math.max(0, -sd * 1.5));
+    return 1 - Math.sqrt(Math.max(0, 1 - t * t));
+}
+/**
+ * The displacement map for a baked SDF texture — same bitmap format, same encoder, different
+ * source for the signed distance than {@link buildMap}.
+ *
+ * The scan is the straight one, unlike `buildMap`'s rim-band bound: the shape is whatever the
+ * texture says it is, so there is no axis-aligned band to derive from an SDF. What makes it cheap
+ * anyway is that the padded margin is skipped outright (`x < 0 || x >= w` needs no tap at all) and
+ * that the field is only non-neutral where `intensity > 0` — a thin band inside the glyph edges.
+ * The whole build is memoised on `(box, texture)`, and for a clock face neither ever changes.
+ */
+function buildSdfMap(spec, branch) {
+    const sdf = spec.sdf;
+    const w = Math.max(1, Math.round(spec.width));
+    const h = Math.max(1, Math.round(spec.height));
+    const cw = w + FILTER_PAD * 2;
+    const ch = h + FILTER_PAD * 2;
+    const canvas = mapCanvas(cw, ch);
+    const ctx = canvas.getContext('2d');
+    if (!ctx)
+        return { url: '', vmax: 1 };
+    const image = ctx.createImageData(cw, ch);
+    const data = image.data;
+    new Uint32Array(data.buffer).fill(NEUTRAL_WORD);
+    const hw = w / 2;
+    const hh = h / 2;
+    const texW = sdf.width;
+    const texH = sdf.height;
+    /** Non-neutral texels, encoded in pass 2 once `vmax` is known — same two-pass shape as `buildMap`. */
+    const rim = [];
+    let vmax = 0;
+    for (let j = 0; j < ch; j++) {
+        const y = j - FILTER_PAD;
+        if (y < 0 || y >= h)
+            continue;
+        // `p = coord / size * sdfTexSize` with `coord` a pixel *centre*, then down to the texel-centre
+        // convention `eval` uses.
+        const ty = ((y + 0.5) / h) * texH - 0.5;
+        const rowBase = j * cw;
+        for (let i = 0; i < cw; i++) {
+            const x = i - FILTER_PAD;
+            if (x < 0 || x >= w)
+                continue;
+            const tx = ((x + 0.5) / w) * texW - 0.5;
+            const intensity = sdfIntensity(sdf, tx, ty);
+            if (intensity <= 0)
+                continue;
+            // `dispersionIntensity` — same element-space field as the rounded-rect map, so a
+            // chromatic-aberration call site behaves identically on this path. The catalog's clock
+            // does not ask for it, but the branch is carried rather than ignored.
+            const dispersion = ((x - hw) * (y - hh)) / (hw * hh);
+            const m = intensity * (1 + branch * dispersion);
+            if (m > vmax)
+                vmax = m;
+            rim.push({ index: (rowBase + i) * 4, gx: sdfNx, gy: sdfNy, m });
+        }
+    }
+    const k = vmax > 0 ? 127 / vmax : 0;
+    for (const pixel of rim) {
+        if (pixel.m <= 0)
+            continue;
+        const s = pixel.m * k;
+        // Same `128 − g·s` encoder as `buildMap`, so the same "inward" sense reaches the filter:
+        // the shader's `coord − intensity · refractionHeight · normal` moves the sample *into* the
+        // shape along the outward normal, which is the negative of it.
+        data[pixel.index] = clampByte(128 - pixel.gx * s);
+        data[pixel.index + 1] = clampByte(128 - pixel.gy * s);
+    }
+    ctx.putImageData(image, 0, 0);
+    return { url: canvas.toDataURL('image/png'), vmax: vmax > 0 ? vmax : 1 };
+}
+/**
+ * The bevel light, baked into a single **multiplier** image.
+ *
+ * The shader's tail is
+ *
+ * ```
+ * color.rgb *= 1 + 0.5·intensity·clamp(dot(normal,  lightDir), 0, 1);
+ * color.rgb *= 1 + 0.5·clamp(dot(normal, -lightDir), 0, 1)·min(1, smoothstep(1, 0, |intensity−0.25|·6));
+ * ```
+ *
+ * which is two multiplications and therefore two `color × (1 + k)` applications. Both collapse
+ * into one factor `1 + α`, and then into a single `feComposite arithmetic` with `k1 = k3 = 1`:
+ *
+ * ```
+ * k1·map·color + k3·color = color·(1 + α)
+ * ```
+ *
+ * That is the whole reason this is expressible without `feBlend`-ing two images and without ever
+ * having a copy of the backdrop. `α = 0.5·intensity·front + 0.5·back·band` never exceeds `0.5`
+ * (the two `clamp`s are the positive and negative parts of one dot product, so they cannot both
+ * be non-zero), which is what keeps the 8-bit encoding from clipping.
+ *
+ * `intensity` and the normal come from the texture alone, so this depends on the box, the texture
+ * and the light angle — not on `refractionHeight`, which only scales the bend.
+ */
+function buildBevelMap(spec) {
+    const sdf = spec.sdf;
+    const angle = (((spec.sdfLightAngle ?? 45) * Math.PI) / 180) % (Math.PI * 2);
+    const lx = Math.cos(angle);
+    const ly = Math.sin(angle);
+    const w = Math.max(1, Math.round(spec.width));
+    const h = Math.max(1, Math.round(spec.height));
+    const cw = w + FILTER_PAD * 2;
+    const ch = h + FILTER_PAD * 2;
+    const canvas = mapCanvas(cw, ch);
+    const ctx = canvas.getContext('2d');
+    if (!ctx)
+        return { url: '', vmax: 1 };
+    const image = ctx.createImageData(cw, ch);
+    const data = image.data;
+    // Opaque black = "no brightening". The alpha has to stay 1: `feComposite` works on
+    // premultiplied values, and a transparent map would contribute nothing at all rather than a
+    // zero multiplier — the two are the same here, but only by accident of `k3 = 1`.
+    new Uint32Array(data.buffer).fill(OPAQUE_BLACK_WORD);
+    const texW = sdf.width;
+    const texH = sdf.height;
+    for (let j = 0; j < ch; j++) {
+        const y = j - FILTER_PAD;
+        if (y < 0 || y >= h)
+            continue;
+        const ty = ((y + 0.5) / h) * texH - 0.5;
+        const rowBase = j * cw;
+        for (let i = 0; i < cw; i++) {
+            const x = i - FILTER_PAD;
+            if (x < 0 || x >= w)
+                continue;
+            const intensity = sdfIntensity(sdf, ((x + 0.5) / w) * texW - 0.5, ty);
+            if (intensity <= 0)
+                continue;
+            const dot = sdfNx * lx + sdfNy * ly;
+            const front = dot > 0 ? (dot > 1 ? 1 : dot) : 0;
+            const back = dot < 0 ? (dot < -1 ? 1 : -dot) : 0;
+            // `smoothstep(1, 0, |intensity − 0.25|·6)` — reversed edges, so it is 1 at
+            // `intensity = 0.25` and falls to 0 by `0.417`.
+            const t = Math.max(0, Math.min(1, 1 - Math.abs(intensity - 0.25) * 6));
+            const band = Math.min(1, t * t * (3 - 2 * t));
+            const alpha = 0.5 * intensity * front + 0.5 * back * band;
+            if (alpha <= 0)
+                continue;
+            const index = (rowBase + i) * 4;
+            const value = clampByte(alpha * 255);
+            data[index] = value;
+            data[index + 1] = value;
+            data[index + 2] = value;
+        }
+    }
+    ctx.putImageData(image, 0, 0);
+    return { url: canvas.toDataURL('image/png'), vmax: 1 };
+}
+/** Memoised on `(box, texture, light angle)` — the light angle is the only free parameter. */
+function bevelMap(spec) {
+    if (!spec.sdf)
+        return { url: '', vmax: 1 };
+    const key = `bevel|${Math.round(spec.width)}x${Math.round(spec.height)}|${spec.sdf.key}|${spec.sdfLightAngle ?? 45}`;
+    const hit = mapCache.get(key);
+    if (hit !== undefined)
+        return hit;
+    const entry = buildBevelMap(spec);
     if (mapCache.size >= MAP_LIMIT) {
         const oldest = mapCache.keys().next().value;
         if (oldest !== undefined)
@@ -612,6 +892,90 @@ function feAddElement(a, b, result) {
     return el;
 }
 /**
+ * `out = map·color + color` — `feComposite arithmetic` with `k1 = k3 = 1`, i.e. the shader's
+ * `color.rgb *= 1 + α` with `α` pre-baked into `map`. See `buildBevelMap`: both bevel terms of
+ * `SdfShaderString` collapse into that one multiplier, so the whole lighting model costs one
+ * `feImage` and one `feComposite` rather than a blend chain.
+ */
+function feMultiplyElement(map, color) {
+    const el = document.createElementNS(SVG_NS, 'feComposite');
+    el.setAttribute('in', map);
+    el.setAttribute('in2', color);
+    el.setAttribute('operator', 'arithmetic');
+    el.setAttribute('k1', '1');
+    el.setAttribute('k2', '0');
+    el.setAttribute('k3', '1');
+    el.setAttribute('k4', '0');
+    return el;
+}
+/** `feFlood` — a flat colour over a region, the no-bitmap stand-in for `drawRect(color)`. */
+function feFloodElement(result) {
+    const el = document.createElementNS(SVG_NS, 'feFlood');
+    el.setAttribute('result', result);
+    return el;
+}
+/**
+ * `feComposite operator="over"` — plain source-over, `src + dst·(1 − src.a)`.
+ *
+ * Not the `k2 = k3 = 1` addition used for the capture overlay: a translucent wash is an alpha
+ * composite, and adding it would brighten by `alpha` regardless of what is underneath instead of
+ * covering it by `alpha`.
+ */
+function feOverElement(src, dst, result) {
+    const el = document.createElementNS(SVG_NS, 'feComposite');
+    el.setAttribute('in', src);
+    el.setAttribute('in2', dst);
+    el.setAttribute('operator', 'over');
+    el.setAttribute('result', result);
+    return el;
+}
+/** `feColorMatrix type="matrix"` — the carrier for {@link RefractionSpec.colorControls}. */
+function feColorMatrixElement(result) {
+    const el = document.createElementNS(SVG_NS, 'feColorMatrix');
+    el.setAttribute('type', 'matrix');
+    el.setAttribute('result', result);
+    // Restated here even though `<filter>` sets it and primitives inherit: a colour matrix's
+    // coefficients are defined on **sRGB** values, and under linear-light interpolation the same
+    // numbers mean something else entirely — the saturation expansion lands on a different curve and
+    // the glass comes out drained. The Kotlin `ColorMatrixColorFilter` is an sRGB operation too.
+    el.setAttribute('color-interpolation-filters', 'sRGB');
+    return el;
+}
+/**
+ * `colorControls` exactly as `ColorFilter.kt` builds it: one 4×5 matrix, coefficients taken
+ * verbatim from `colorControlsColorFilter`.
+ *
+ * `feColorMatrix` operates on non-premultiplied colour, which is also what the Kotlin `ColorMatrix`
+ * sees, so the translation is direct. The only change is that `t` stays normalised rather than
+ * being multiplied by 255:
+ *
+ * ```
+ * Kotlin:  t = (0.5f - c * 0.5f + brightness) * 255f
+ * here:    t =   0.5  - c * 0.5  + brightness
+ * ```
+ *
+ * `brightness` is the upstream value, not `1 + brightness`. Getting that wrong is invisible at
+ * `brightness = 0` and a 25-level constant shift at `-0.1`.
+ *
+ * `toFixed` rather than bare numbers, so the string is stable across calls — `update()` skips the
+ * write when it is unchanged, and float-formatting noise would defeat that.
+ */
+function feColorControlsValues(brightness, contrast, saturation) {
+    const invSat = 1 - saturation;
+    const lr = 0.213 * invSat;
+    const lg = 0.715 * invSat;
+    const lb = 0.072 * invSat;
+    const c = contrast;
+    const t = 0.5 - c * 0.5 + brightness;
+    const cr = c * lr;
+    const cg = c * lg;
+    const cb = c * lb;
+    const cs = c * saturation;
+    const fmt = (v) => v.toFixed(6);
+    const row = (r, g, b) => `${fmt(r)} ${fmt(g)} ${fmt(b)} 0 ${fmt(t)}`;
+    return [row(cr + cs, cg, cb), row(cr, cg + cs, cb), row(cr, cg, cb + cs), '0 0 0 1 0'].join('  ');
+}
+/**
  * One filter per glass surface. The displacement *maps* are shared through
  * {@link refractionMap}; only the tiny `<filter>` element is per-surface, which is what
  * lets two thumbs animate to different refraction strengths at the same time. Surfaces
@@ -631,6 +995,10 @@ function createGlassFilter() {
     let caMode = null;
     let zoomMode = null;
     let overlayMode = null;
+    let bevelMode = null;
+    let washMode = null;
+    let colorMode = null;
+    let gainMode = null;
     let maps = [];
     let displacements = [];
     let nodes = [];
@@ -645,6 +1013,18 @@ function createGlassFilter() {
     let lastOverlayUrl = null;
     /** The overlay placement last written — `x`/`y` move every frame, `width`/`height` do not. */
     let lastOverlayPlacement = '';
+    /** The bevel multiplier map (`SdfShader` only), and the key its `href` was set from. */
+    let bevelImageEl = null;
+    let bevelKey = null;
+    /** The `feFlood` carrying the `onDrawBackdrop` wash, and the colour it was last set from. */
+    let washFloodEl = null;
+    let washKey = null;
+    /** The backdrop-gain matrix, and the `values` string it was last built from. */
+    let gainMatrixEl = null;
+    let gainValues = null;
+    /** The `colorControls` matrix, and the `values` string it was last built from. */
+    let colorMatrixEl = null;
+    let colorValues = null;
     /**
      * Per displacement node: the `scale` string last written. `update()` runs on **every** redraw,
      * including every frame of a scroll, and a scroll changes none of the inputs `scale` is built
@@ -653,7 +1033,7 @@ function createGlassFilter() {
      * write and expensive to have written. Skipping the identical write is the whole fix.
      */
     let lastScales = [];
-    function buildGraph(ca, zoom, overlay) {
+    function buildGraph(ca, zoom, overlay, gain, wash, color, bevel) {
         while (filter.firstChild)
             filter.removeChild(filter.firstChild);
         maps = [];
@@ -666,10 +1046,47 @@ function createGlassFilter() {
         overlayImageEl = null;
         lastOverlayUrl = null;
         lastOverlayPlacement = '';
+        bevelImageEl = null;
+        bevelKey = null;
+        washFloodEl = null;
+        washKey = null;
+        gainMatrixEl = null;
+        gainValues = null;
+        colorMatrixEl = null;
+        colorValues = null;
         lastScales = [];
+        // The gain undoes a page-level scrim the destination painted behind the plate (see
+        // `RefractionSpec.backdropGain`). It has to come first, and it has to be its own primitive:
+        // the wash below is an alpha composite, so it cannot scale the backdrop and still be a
+        // correct `over`, and the colour matrix further down is the shader's own `colorControls`.
+        let chainInput = 'SourceGraphic';
+        if (gain) {
+            const matrix = feColorMatrixElement('gained');
+            gainMatrixEl = matrix;
+            nodes.push(matrix);
+            chainInput = 'gained';
+        }
+        // The wash goes on next: upstream it is part of the recorded layer the render effect is
+        // attached to, so it enters the shader's `content` input exactly like the backdrop does.
+        // Anything drawn after it — the zoom, the refraction — therefore acts on `backdrop + wash`.
+        if (wash) {
+            const flood = feFloodElement('wash');
+            const over = feOverElement('wash', chainInput, 'washed');
+            washFloodEl = flood;
+            nodes.push(flood, over);
+            chainInput = 'washed';
+        }
+        // `colorControls` next, so it sees `backdrop + wash` exactly as the render effect does — that
+        // is what makes `saturate(1.5)` put the colour back into a wash-desaturated glyph instead of
+        // arriving too early to touch it.
+        if (color) {
+            const matrix = feColorMatrixElement('tinted');
+            colorMatrixEl = matrix;
+            nodes.push(matrix);
+            chainInput = 'tinted';
+        }
         // The zoom stage samples with its own fixed scale, and the refraction chain refracts the
         // already-magnified image — the original's `onDrawBackdrop`-then-effects order.
-        let chainInput = 'SourceGraphic';
         if (zoom) {
             const zMap = feImageElement('zmap');
             const zDisp = feDisplacementElement('SourceGraphic', 'zmap', 'zoomed');
@@ -687,9 +1104,14 @@ function createGlassFilter() {
             nodes.push(oImg, oAdd);
             chainInput = 'composed';
         }
+        // The refraction chain's last stage has to be *named* for the bevel to reach it: a filter
+        // primitive can address an earlier one only via `result`, and the graph's implicit output is
+        // not addressable by name. Without a bevel every name is left off, so the existing graphs are
+        // byte-for-byte what they were.
+        const refracted = bevel ? 'refracted' : undefined;
         if (!ca) {
             const map = feImageElement('map');
-            const displace = feDisplacementElement(chainInput, 'map');
+            const displace = feDisplacementElement(chainInput, 'map', refracted);
             maps.push(map);
             displacements.push(displace);
             mapKeys.push(null);
@@ -706,11 +1128,18 @@ function createGlassFilter() {
             const dispG = feDisplacementElement('srcG', 'mapG', 'dispG');
             const dispB = feDisplacementElement('srcB', 'mapB', 'dispB');
             const addRG = feAddElement('dispR', 'dispG', 'rg');
-            const addRGB = feAddElement('rg', 'dispB');
+            const addRGB = feAddElement('rg', 'dispB', refracted);
             maps.push(mapR, mapG, mapB);
             displacements.push(dispR, dispG, dispB);
             mapKeys.push(null, null, null);
             nodes.push(mapR, mapG, mapB, srcR, srcG, srcB, dispR, dispG, dispB, addRG, addRGB);
+        }
+        // `SdfShader`'s bevel, applied to the refracted result and therefore last in the graph.
+        if (bevel) {
+            const bevelImage = feImageElement('bevel');
+            const bevelMultiply = feMultiplyElement('bevel', 'refracted');
+            bevelImageEl = bevelImage;
+            nodes.push(bevelImage, bevelMultiply);
         }
         filter.append(...nodes);
         // Primitive subregions must be explicit: the defaults are percentages of the element's
@@ -719,12 +1148,32 @@ function createGlassFilter() {
         // would otherwise leave every primitive with the broken defaults.
         if (lastWidth !== 0) {
             for (const node of nodes) {
+                // The flood is the one primitive whose region is *not* the padded box — see below.
+                if (node === washFloodEl)
+                    continue;
                 node.setAttribute('x', String(-FILTER_PAD));
                 node.setAttribute('y', String(-FILTER_PAD));
                 node.setAttribute('width', String(lastWidth));
                 node.setAttribute('height', String(lastHeight));
             }
+            applyWashRegion();
         }
+    }
+    /**
+     * The wash covers the element box only.
+     *
+     * Upstream it is painted into a layer recorded at the element's own size, so a `drawRect` there
+     * fills exactly the box. Letting the flood take the padded filter region instead would put 25 %
+     * white outside the shape, where `feDisplacementMap` samples it and drags it inward across the
+     * rim — a bright fringe around every glyph edge.
+     */
+    function applyWashRegion() {
+        if (!washFloodEl)
+            return;
+        washFloodEl.setAttribute('x', '0');
+        washFloodEl.setAttribute('y', '0');
+        washFloodEl.setAttribute('width', String(Math.max(0, lastWidth - FILTER_PAD * 2)));
+        washFloodEl.setAttribute('height', String(Math.max(0, lastHeight - FILTER_PAD * 2)));
     }
     svgRoot().appendChild(filter);
     let lastMapKey = '';
@@ -736,11 +1185,28 @@ function createGlassFilter() {
             const ca = !!spec.chromaticAberration;
             const hasZoom = !!zoom && zoom.factor > 0 && zoom.factor !== 1;
             const hasOverlay = !!overlay && !!overlay.url;
-            if (ca !== caMode || hasZoom !== zoomMode || hasOverlay !== overlayMode) {
+            const hasBevel = !!spec.sdf;
+            const hasWash = !!spec.wash;
+            const hasColor = !!spec.colorControls;
+            const gain = spec.backdropGain != null && spec.backdropGain > 0 && spec.backdropGain !== 1
+                ? spec.backdropGain
+                : null;
+            const hasGain = gain !== null;
+            if (ca !== caMode ||
+                hasZoom !== zoomMode ||
+                hasOverlay !== overlayMode ||
+                hasBevel !== bevelMode ||
+                hasWash !== washMode ||
+                hasColor !== colorMode ||
+                hasGain !== gainMode) {
                 caMode = ca;
                 zoomMode = hasZoom;
                 overlayMode = hasOverlay;
-                buildGraph(ca, hasZoom, hasOverlay);
+                bevelMode = hasBevel;
+                washMode = hasWash;
+                colorMode = hasColor;
+                gainMode = hasGain;
+                buildGraph(ca, hasZoom, hasOverlay, hasGain, hasWash, hasColor, hasBevel);
             }
             const width = Math.round(spec.width + FILTER_PAD * 2);
             const height = Math.round(spec.height + FILTER_PAD * 2);
@@ -750,11 +1216,14 @@ function createGlassFilter() {
                 filter.setAttribute('width', String(width));
                 filter.setAttribute('height', String(height));
                 for (const node of nodes) {
+                    if (node === washFloodEl)
+                        continue;
                     node.setAttribute('x', String(-FILTER_PAD));
                     node.setAttribute('y', String(-FILTER_PAD));
                     node.setAttribute('width', String(width));
                     node.setAttribute('height', String(height));
                 }
+                applyWashRegion();
                 lastMapKey = '';
             }
             if (hasZoom && zoomDisplacement && zoomMapEl) {
@@ -801,17 +1270,60 @@ function createGlassFilter() {
                     overlayImageEl.setAttribute('href', overlay.url);
                 }
             }
-            // `amount` is the animation knob and changes independently of the map geometry. The map
-            // encodes magnitudes normalised to `vmax`; the branch's own scale factor restores them.
-            // `feDisplacementMap` offsets by `scale * (channel/255 - 0.5)`, so `amount * vmax` is that
-            // branch's largest shift, px.
+            // The wash colour. Flat at every call site that uses it, so the two attributes are written
+            // once — but still guarded, because an attribute write on a filter primitive dirties the
+            // whole graph and this one runs on every redraw.
+            if (hasWash && washFloodEl && spec.wash) {
+                const key = `${spec.wash.color}|${spec.wash.alpha}`;
+                if (key !== washKey) {
+                    washKey = key;
+                    washFloodEl.setAttribute('flood-color', spec.wash.color);
+                    washFloodEl.setAttribute('flood-opacity', String(spec.wash.alpha));
+                }
+            }
+            // The backdrop gain. A diagonal matrix, and a very short string — skipped when unchanged
+            // like every other write here.
+            if (hasGain && gainMatrixEl && gain != null) {
+                const g = gain;
+                const values = `${g} 0 0 0 0  0 ${g} 0 0 0  0 0 ${g} 0 0  0 0 0 1 0`;
+                if (values !== gainValues) {
+                    gainValues = values;
+                    gainMatrixEl.setAttribute('values', values);
+                }
+            }
+            // The colour matrix. Rebuilt from the three uniforms and skipped when unchanged — the same
+            // guard the other stages use, and the reason the values string is formatted deterministically.
+            if (hasColor && colorMatrixEl && spec.colorControls) {
+                const cc = spec.colorControls;
+                const values = feColorControlsValues(cc.brightness, cc.contrast, cc.saturation);
+                if (values !== colorValues) {
+                    colorValues = values;
+                    colorMatrixEl.setAttribute('values', values);
+                }
+            }
+            // The bevel multiplier. Static for a given box, texture and light angle — a clock face
+            // changes none of the three, so this writes its `href` once and then never again.
+            if (hasBevel && bevelImageEl && spec.sdf) {
+                const key = `bevel|${Math.round(spec.width)}x${Math.round(spec.height)}|${spec.sdf.key}|${spec.sdfLightAngle ?? 45}`;
+                if (key !== bevelKey) {
+                    bevelKey = key;
+                    const entry = bevelMap(spec);
+                    if (entry.url)
+                        bevelImageEl.setAttribute('href', entry.url);
+                }
+            }
+            // The animation knob. `lens()` animates `refractionAmount`; `SdfShader` has no such
+            // parameter — its `apply(refractionHeight)` *is* the displacement scale, because the field
+            // being scaled is baked into the texture. Either way this is the only input that changes
+            // while a call site animates, and it lands as a plain `scale` attribute.
             //
             // Skipped when the value is unchanged. A scroll changes none of the inputs this is built
             // from, so the identical string used to be re-written to every node on every frame — and an
             // attribute write on a filter primitive dirties the filter, which is what turns a cheap
             // write into an expensive re-rasterisation.
+            const scaleBase = spec.sdf ? spec.refractionHeight : amount;
             displacements.forEach((displace, index) => {
-                const next = String(amount * 2 * entries[index].vmax);
+                const next = String(scaleBase * 2 * entries[index].vmax);
                 if (lastScales[index] === next)
                     return;
                 lastScales[index] = next;

@@ -63,6 +63,28 @@ const props = defineProps<{
   shadow?: () => Shadow | null
   /** `onDrawSurface = { drawRect(...) }` */
   onDrawSurface?: (ctx: CanvasRenderingContext2D, size: Size) => void
+  /**
+   * `onDrawBackdrop { drawBackdrop(); drawRect(color) }` — a flat wash drawn **into** the captured
+   * backdrop, ahead of the effects chain. Channels are 0–255.
+   *
+   * Deliberately not `onDrawSurface`. `DrawBackdropModifier` is explicit about the order: the
+   * backdrop layer is recorded by `recordBackdropBlock`, the render effect is attached to that
+   * same layer, and `onDrawSurface` runs in `ContentDrawScope.draw()` *after* `drawBackdropLayer()`.
+   * So `onDrawBackdrop` draws inside the shader and `onDrawSurface` draws outside it — only the
+   * first gets cut to the shape by `content.eval(...) * v.a`. Routing the clock's wash through
+   * `onDrawSurface` put a lit rectangle over the whole box, which is what the screen showed.
+   */
+  backdropWash?: () => { r: number; g: number; b: number; alpha: number } | null
+  /**
+   * Alpha of a black scrim the destination painted **behind** this surface, if any.
+   *
+   * Upstream this is invisible: a surface samples a `LayerBackdrop`, and the destinations that
+   * dim their own content (`Lock screen`) do it in a sibling of the wallpaper recording, so the
+   * dimming never reaches the plate. The browser has no such separation — `backdrop-filter`
+   * samples everything painted behind, scrim included — so the destination has to declare it and
+   * the filter undoes it with a `1 / (1 - scrim)` gain. See `RefractionSpec.backdropGain`.
+   */
+  backdropScrim?: number
   /** `innerShadow { }` — defaults to null, unlike `highlight` / `shadow`. */
   innerShadow?: () => InnerShadow | null
   /**
@@ -187,6 +209,29 @@ function decorationBoxStyle() {
     transformOrigin: 'center'
   }
 }
+
+/**
+ * The lens rides a **reactive** binding rather than `applyLensStyle`, and that is the whole point.
+ *
+ * `applyLensStyle` runs from `redraw`, which is triggered by size, layout epoch or
+ * `animationRevision`. A drag changes none of the three — it writes the `offset` prop, and the
+ * three canvases plus the content pick that up through their computed boxes while the lens, whose
+ * transform was written imperatively, never moved. The clock's wash slid across the screen and the
+ * refraction stayed put.
+ *
+ * Everything else about the lens (`backdrop-filter`, the mask, the clip path) still comes from
+ * `applyLensStyle`, because those have to be re-derived from an `effects { }` block that reads
+ * non-reactive state on every frame.
+ */
+const lensBoxStyle = computed(() => {
+  void animationRevision.value
+  const style: Record<string, string> = { transformOrigin: 'center' }
+  const transform = currentCssTransform()
+  if (transform !== 'none') style.transform = transform
+  const alpha = currentTransform().alpha
+  if (alpha !== 1) style.opacity = String(alpha)
+  return style
+})
 
 const contentStyle = computed(() => {
   void animationRevision.value
@@ -333,11 +378,6 @@ function applyLensStyle(): void {
   const height = size.value.height
   if (!el || width <= 0 || height <= 0) return
 
-  const transform = currentCssTransform()
-  setStyle(el, 'transform', transform === 'none' ? '' : transform)
-  setStyle(el, 'transform-origin', 'center')
-  const alpha = currentTransform().alpha
-  setStyle(el, 'opacity', alpha === 1 ? '' : String(alpha))
   setStyle(el, 'clip-path', clipPathFor(props.shape, width, height))
 
   if (!props.backdrop.samples) {
@@ -350,9 +390,22 @@ function applyLensStyle(): void {
   effectScope.size = { width, height }
   props.effects?.(effectScope)
 
-  const base = effectScope.backdropFilterCss()
+  // `SdfShader`'s colour work moves inside the filter (see `RefractionSpec.colorControls`), so the
+  // CSS side keeps only the blur — leaving the functions here as well would apply them twice.
+  const sdf = effectScope.sdf
+  const base = sdf ? effectScope.blurCss() : effectScope.backdropFilterCss()
 
   // `AlphaMask` runtime shader → mask + tint on this same element (see the gradient above).
+  //
+  // `SdfShader` wants the same property for its own reason: the shader ends with
+  // `content.eval(refractedCoord) * v.a`, so the *shape's own coverage* masks the refracted
+  // backdrop — and the SDF texture's alpha channel is exactly that coverage. Pointing the browser
+  // at the original asset rather than at a decoded copy is deliberate: the mask is sampled at
+  // full resolution, so the glyph outlines stay as sharp as the source, while the fields that go
+  // through a canvas (distance, normal) are smooth by construction and lose nothing.
+  //
+  // One property, two sources, and they are mutually exclusive in practice, so this is a plain
+  // either/or rather than a composition.
   const alphaMask = effectScope.shaderRequests.find((r) => r.key === 'AlphaMask')
   if (alphaMask) {
     const intensity = alphaMask.floats.get('tintIntensity')?.[0] ?? 0.8
@@ -360,29 +413,71 @@ function applyLensStyle(): void {
     setStyle(el, '-webkit-mask-image', ALPHA_MASK_GRADIENT)
     setStyle(el, 'mask-image', ALPHA_MASK_GRADIENT)
     setStyle(el, 'background-color', tint ? withAlpha(tint, intensity) : '')
+  } else if (sdf) {
+    const url = `url("${sdf.texture.key}")`
+    setStyle(el, '-webkit-mask-image', url)
+    setStyle(el, 'mask-image', url)
+    // The shader maps the whole element onto the whole texture (`p = coord / size * sdfTexSize`),
+    // so the mask has to stretch to the box rather than sit at its intrinsic size and tile.
+    setStyle(el, '-webkit-mask-size', '100% 100%')
+    setStyle(el, 'mask-size', '100% 100%')
+    setStyle(el, '-webkit-mask-repeat', 'no-repeat')
+    setStyle(el, 'mask-repeat', 'no-repeat')
+    setStyle(el, 'background-color', '')
   } else {
     setStyle(el, '-webkit-mask-image', '')
     setStyle(el, 'mask-image', '')
+    setStyle(el, '-webkit-mask-size', '')
+    setStyle(el, 'mask-size', '')
+    setStyle(el, '-webkit-mask-repeat', '')
+    setStyle(el, 'mask-repeat', '')
     setStyle(el, 'background-color', '')
   }
 
   const refraction = effectScope.refraction
-  if (!refraction || !glassFilter) {
+  if ((!refraction && !sdf) || !glassFilter) {
     setStyle(el, 'backdrop-filter', base)
     setStyle(el, '-webkit-backdrop-filter', base)
     return
   }
+
+  // The wash, read once. It goes in raw: the filter composites it ahead of `colorControls`, so the
+  // colour matrix treats it exactly as the upstream layer does — including `saturate`, which is
+  // what keeps the glyphs tinted instead of washed out.
+  const wash = props.backdropWash?.() ?? null
 
   glassFilter.update(
     {
       width,
       height,
       cornerRadii: props.shape.cornerRadii(width, height),
-      refractionHeight: refraction.refractionHeight,
-      depthEffect: refraction.depthEffect,
-      chromaticAberration: refraction.chromaticAberration
+      // On the SDF path this is the *displacement scale* rather than a rebuild trigger — the
+      // field it scales is baked into the texture (see `RefractionSpec.sdf`).
+      refractionHeight: refraction?.refractionHeight ?? sdf!.refractionHeight,
+      depthEffect: refraction?.depthEffect,
+      chromaticAberration: refraction?.chromaticAberration,
+      sdf: sdf?.texture ?? null,
+      sdfLightAngle: sdf?.lightAngle,
+      wash: wash ? { color: `rgb(${wash.r}, ${wash.g}, ${wash.b})`, alpha: wash.alpha } : null,
+      // A scrim only ever darkens, so the compensation only ever brightens — and `1 / (1 - a)`
+      // recovers the wallpaper exactly, because `rgba(0,0,0,a)` over `W` is `(1 - a)·W`.
+      backdropGain:
+        props.backdropScrim != null && props.backdropScrim > 0
+          ? 1 / (1 - Math.min(props.backdropScrim, 0.999))
+          : undefined,
+      // Must travel together with the `blurCss()` base above — one without the other either drops
+      // the colour work or applies it twice.
+      colorControls: sdf
+        ? {
+            // Upstream value, not `1 + brightness`: `BackdropEffectScope` stores the CSS
+            // multiplier, and the matrix wants the additive form.
+            brightness: effectScope.brightness - 1,
+            contrast: effectScope.contrast,
+            saturation: effectScope.saturation
+          }
+        : null
     },
-    refraction.refractionAmount,
+    refraction?.refractionAmount ?? 0,
     props.backdropZoom?.() ?? null,
     props.captureOverlay?.() ?? null
   )
@@ -547,7 +642,7 @@ defineExpose({ el: rootEl, lens: lensEl, redraw, scheduleRedraw, size })
       :style="shadowBoxStyle"
       aria-hidden="true"
     />
-    <div ref="lensEl" class="glass-surface__lens" aria-hidden="true" />
+    <div ref="lensEl" class="glass-surface__lens" :style="lensBoxStyle" aria-hidden="true" />
     <canvas
       ref="overlayCanvasEl"
       class="glass-surface__overlay"
