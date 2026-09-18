@@ -378,7 +378,9 @@ To regenerate (when upstream `src/core/glass-filter.ts` changes), strip types wi
 
 There are exactly two post-processing steps: drop the **leading** `export ` prefixes (the previous revision had three: `FILTER_PAD` / `isRefractionSupported` / `createGlassFilter`), and the `svgRoot()` line below.
 
-**Do not hard-code the line range of section 1** — locate it with the same markers the probe uses: from the nearest preceding `/*` before `/** SVG refraction filter for`, to the nearest preceding `/*` before `* 2. Userscript host`. Assert that "the old block == the result of running the same pipeline against HEAD" before splicing, and refuse to write if it does not — that way a transformation that gains or loses a step is caught on step one.
+**Do not hard-code the line range of section 1** — locate it with the same markers the probe uses: from the nearest preceding `/*` before `/** SVG refraction filter for`, to the nearest preceding `/*` before `* 2. Userscript host`. Before splicing, run **invariant checks** (no surviving leading `export `, the documented `svgRoot()` deviation present, `NEUTRAL_WORD` / `buildMap` / `createGlassFilter` present) and refuse to write if any fails.
+
+⚠️ **Do not self-prove by "the old block == the result of running the same pipeline against HEAD"**: that assertion only holds while the userscript is in sync with `HEAD`. As soon as the core has uncommitted work — the script already carrying the previous revision — it **misreports** and refuses a perfectly correct write. The real verification is `npm run probe:map`, which evaluates the spliced section 1 in Node and fails loudly on a malformed result.
 
 Afterwards, always run: `npm run check:userscript` + `npm run probe:band` + `npm run probe:render`.
 
@@ -622,11 +624,12 @@ filter region larger than the element itself — a 1408×160 row is rasterised a
 shrinking it per surface buys some back, but not a different order of magnitude.
 
 Any further headroom on this carrier comes from **rasterising less** (fewer refractive surfaces on
-screen, or smaller ones), not from faster JS. Dropping `backdrop-filter` and painting the backdrop
-yourself would recover the magnitude, but that route requires the application to know what the
-backdrop *is* — and the entire point of `backdrop` is refracting what is **genuinely behind** it
-(§3.3), not the application's own wallpaper, and it does not carry over to the userscript's
-arbitrary-site case. **That was explicitly rejected; do not raise it again.**
+screen, or smaller ones), not from faster JS. The other obvious route — dropping `backdrop-filter`
+and painting the backdrop yourself — would recover the magnitude, but it requires the application to
+know what the backdrop *is*, and the entire point of `backdrop` is refracting what is **genuinely
+behind** it (§3.3), not the application's own wallpaper; it also does not carry over to the
+userscript's arbitrary-site case. **This project therefore does not take that route**, and the
+performance work here stays within "rasterise less".
 
 ---
 
