@@ -74,6 +74,8 @@ Why split highlights across two canvases? Because **Canvas cannot do "addition"*
 
 Maps are memoised by `(width × height × corner-radii × refraction-depth × chromatic?)`, so identical shapes share one bitmap; per frame only the cheap `feDisplacementMap` `scale` is updated to drive the animation.
 
+The same chain also carries the refraction of a **baked SDF texture** (the lock-screen clock): there the displacement map is not derived from a rounded-rect analytically but decoded from the texture's `r` / `gb` channels, and the shape cut is a `mask-image` off the texture's alpha channel. See §9.
+
 ### 3.4 Highlight system (highlight-map / interactive-highlight)
 
 Upstream builds **AGSL shaders** for the `Default` / `Ambient` highlights via `paint.setRuntimeShader` — and Android's Paint modulates shader output by the *color alpha*, so the rim alpha = `styleColorAlpha · |⟨SDF outer normal, (cos angle, sin angle)⟩| ^ falloff`.
@@ -200,21 +202,7 @@ npm run probe:fidelity    # render fingerprint of 13 destinations, for A/B acros
 
 ---
 
-## 6. Porting conventions (hard rules)
-
-1. **Animation values stay out of Vue reactivity**: `animationRevision` must be a `ref`; otherwise the whole page silently no-ops.
-2. **`argb()` takes 8-digit ARGB** (`argb(0xff34c759)`); passing 6-digit hex yields alpha=0 (fully transparent).
-3. **Omitting `highlight`/`shadow` ≠ disabling**: Kotlin defaults are `Highlight.Default` / `Shadow.Default`; default props must fall back to defaults (only ControlCenter explicitly passes `shadow = null`).
-4. **Keep the 1:1 port**; any allowed deviation must be justified in a comment (e.g. ControlCenter's `onVerticalDrag` extension, Magnifier's Canvas 2D redraw passages).
-5. **Add no decoration absent from the original**: the original is full-bleed with no phone bezel / back capsule (the top-left Back is the skiko `BackHandler`'s blue `LiquidButton`, already reproduced).
-6. **Globally disable text selection**: `.app-root` uses `user-select:none` etc.; only `input/textarea/[contenteditable]` keep selection. Do **not** `preventDefault` selection in the gesture layer (it swallows the native `@click` that `RippleSurface` relies on).
-7. **Paint both press-highlight branches**, and pass the **absolute local pointer coordinate** (not `offset`) as `highlightPosition()`'s second arg (upstream's lambda param is named `offset` but actually receives `positionAnimation.value`).
-8. **For DOM glass, anything that "must not be sampled"**: either don't paint it there, or punch a hole yourself; overlaying a copy is useless — the original still leaks. Scaling a clipped capture layer changes shape, not color; don't drop it casually.
-9. **Read state via animation values**, not the raw `fraction` (e.g. `LiquidToggle`'s `dampedDragAnimation.value`); reading state directly makes it "jump on click" instead of springing.
-
----
-
-## 7. Browser compatibility
+## 6. Browser compatibility
 
 | Capability | Chromium (Chrome/Edge 76+) | Safari / Firefox |
 | --- | --- | --- |
@@ -226,11 +214,12 @@ Refraction (`url()` inside `backdrop-filter`) is a **Chromium extension**. There
 
 ---
 
-## 8. Source mapping (excerpt)
+## 7. Source mapping (excerpt)
 
 | Web | Upstream Kotlin |
 | --- | --- |
 | `src/core/glass-filter.ts` | `Lens.kt` / `Shaders.kt` (refraction, `RoundedRectRefractionShaderString`, `…WithDispersionShaderString`) |
+| `src/core/sdf-texture.ts` | `SdfShader.kt` + `SdfShaderString` (the lock-screen clock's baked SDF texture; see §9) |
 | `src/core/highlight-map.ts` | `HighlightStyle.kt` (AGSL `Ambient`/`Default` shaders) |
 | `src/core/backdrop.ts` | `LayerBackdrop` family (reduced to Root/Empty) |
 | `src/components/GlassSurface.vue` | Compose `Modifier` glass chain |
@@ -240,15 +229,57 @@ Refraction (`url()` inside `backdrop-filter`) is a **Chromium extension**. There
 
 ---
 
-## 9. Known limitations & future work
+## 8. Known limitations & future work
 
 - Refraction is unavailable on non-Chromium browsers (degrades to plain blur).
 - High-frequency filter maps are capped by a 96-entry LRU cache (`mapCache`).
 - If a site's CSP restricts `img-src` (no `data:`), the `<feImage>` displacement maps are refused and it fails **completely silently** — see [§10](#10-userscript-liquid-glass-refraction).
 - Headless environments (`--dump-dom`) starve `rAF`, so spring animations emit only a few frames — verify "is the animation running" by checking whether the inline transform changes over time, not by screenshots.
 - **Large-area glass is still expensive, and the cost sits in one place**: every glass surface maintains its own filter graph for `backdrop-filter` (SDF → displacement map → `feImage` + `feDisplacementMap`), and **only the `url(#…)` displacement graph spends frame time** — drop it and 20 surfaces go from 8.5 fps to 63 fps, the same speed as hiding every glass layer. The constraint is therefore the **count and area of refractive surfaces on screen**, not JS or layout; measurements, definition and the waste already removed are in [§11](#11-performance).
+- Upstream's `colorControls` `brightness` is **additive** (it lands in the colour matrix's constant term, `t = (0.5 − 0.5c + brightness)·255`) while CSS `brightness()` is **multiplicative**; CSS `contrast(0.75)` carries a constant of 31.875 against upstream's 6.375, so mid-grey reads about 6% bright. The clock plate now implements it exactly in the filter with `feColorMatrix` (see §9); **every other page still uses the CSS form**.
 - Future: move `glass-filter` map generation into a Worker; add a WebGL refraction fallback for non-Chromium (if WebGL is permitted at that point).
 
+---
+
+## 9. The clock plate: refracting a baked SDF texture (`LockScreenContent`)
+
+The "12:45" on the original lock screen is not text — it is a **baked SDF texture** (`clock_sdf`, 1599×515) pushed on screen by `SdfShader.apply(48.dp, 45f)`. Channel conventions (authority: the AGSL source `SdfShaderString`; every number below was measured):
+
+| Channel | Meaning | Measured |
+| --- | --- | --- |
+| `r` | signed distance `sd = r/255·2 − 1`, neutral 128 outside the shape | 33.6% inside |
+| `gb` | unit normal `normalize(gb/255·2 − 1)` | mean `\|n\|` after remap = **1.005** |
+| `a` | shape mask `smoothstep(0.5, 1, a)` | 54.7% clear / 31.2% opaque / 14.1% soft edge |
+
+The shader only acts where `sd < 0` (inside): `intensity = circleMap(1 − min(1, −sd·1.5))` is 1 at the boundary and decays to 0 by `sd = −0.667`, so the effective refraction band is **R ∈ (42.5, 127.5)** — structurally the same rim band as `lens()`, only the shape is no longer an analytic rounded rectangle.
+
+The web side is **three exact substitutions, not an approximation** (decoding in `src/core/sdf-texture.ts`; the filter branch is `spec.sdf` in `glass-filter.ts`):
+
+| Upstream shader | Web | Why it holds |
+| --- | --- | --- |
+| `content.eval(refractedCoord)` | `feDisplacementMap` reading a displacement map **decoded from the texture** | the bitmap is the very same format `lens()` uses — only the source of `sd` and the normal changed |
+| `content.eval(...) * v.a` | `mask-image: url(clock_sdf.webp)` on the lens | the texture's alpha channel **is** `v.a`; pointing at the original asset keeps the glyph outlines at full resolution |
+| two `color.rgb *= 1 + k` terms | one `α` multiplier image + `feComposite arithmetic k1=1 k3=1` | `k1·map·color + k3·color = color·(1+α)`; both terms collapse into a single `1+α`, the cross term is identically 0, so `α ∈ [0, 0.5]` never clips |
+
+The 25% white in `onDrawBackdrop` is a `feFlood` + `feComposite operator="over"` (`GlassSurface`'s `backdropWash`) and **has to stay inside the filter graph**: upstream it is recorded into the same graphics layer, so the shader's `* v.a` cuts it to the glyphs. Routed through `onDrawSurface` instead, it becomes a white rectangle over the whole 400×129 box.
+
+### 9.1 Page-level scrims: `backdropScrim`
+
+The 30% black that dims the whole screen (`Column(Modifier.background(Black.copy(0.3f)))`) is **not** in the backdrop the plate samples: `BackdropDemoScaffold` puts `layerBackdrop(backdrop)` on the wallpaper `Image` alone, the scrim is its sibling painted afterwards, and `LayerBackdropNode.draw()` records only that one `drawContent()`. So upstream the glyphs refract the **raw wallpaper** (bright) while everything around them is dimmed — that is where the "light through engraved glass" comes from.
+
+`backdrop-filter` samples **everything physically behind**, scrim included, so the glyphs get dimmed twice and the plate collapses into a flat tint lying on the wallpaper. Since the contamination is one constant multiplication (`rgba(0,0,0,a)` over `W` gives `(1−a)·W`), it can be divided back out after sampling: `GlassSurface`'s `backdropScrim` → `RefractionSpec.backdropGain = 1/(1−a)` → one **stand-alone** diagonal `feColorMatrix` at the head of the chain.
+
+- It has to be **first**: the contamination is at the input of the blur, and blur is linear (`blur((1−a)·W) = (1−a)·blur(W)`), so undoing it after the blur is still exact.
+- It has to be **stand-alone**: the wash is an `over` composite (matching it would need a coefficient of `0.75/0.7 > 1`, which `over` cannot express), and the colour matrix further down carries `colorControls`.
+- **Nothing clips**: the scrim has already pushed values down to `≤ 178.5`, and `× 1/0.7` lands exactly back at `≤ 255`; the only residue is the scrim's own 8-bit quantisation (`≤ 0.7` code values).
+- Only a declaring destination produces that primitive (`hasGain` is part of the graph-shape cache key), so the other 12 destinations gain no primitive at all.
+
+> ⚠️ **The counter-example** is `ControlCenterContent`'s `dimColor`, whose meaning is the opposite: upstream that dim lives in `drawWithContent { drawContent(); drawRect(dimColor) }`, **inside** `layerBackdrop`, and the glass is *supposed* to sample it.
+
+### 9.2 Known differences
+
+- The clock is a **static face** (upstream bakes exactly this "12:45" texture; it was never a running clock). Making it tick is a matter of amortisation: at second-hand rates (once a second) the cost is about **0.13 ms per frame** and can be ignored; per-frame animation (rolling digits) costs about **468 ms per second** and is not viable — replacing an `feImage` `href` re-rasterises the whole filter graph.
+- `colorControls` only goes into the filter (`feColorMatrix`) on this SDF path. **Every other page still uses the CSS multiplicative `brightness`**, which differs from upstream's additive semantics by a constant 25.5 — see [§8](#8-known-limitations--future-work).
 ---
 
 ## 10. Userscript (Liquid Glass Refraction)
@@ -613,5 +644,4 @@ The following components are **known to contain bugs** in the current build; the
 
 The following components are **not yet complete** in the current build (key logic missing or only a skeleton in place); their glass effects differ substantially from the original, so **do not rely on their appearance:**
 
-- **Lock screen / clock (`LockScreenContent`)** — the draggable lock-screen clock plate backed by an SDF texture. The original relies on the `clock_sdf` asset and `SdfShader`; this port has dropped the SDF-related capability, so the clock plate is not yet fully implemented.
 - **Magnifier (`MagnifierContent`)** — the draggable lens over a paragraph, built on backdrop scaling + a refraction chain. The current implementation is incomplete; the lens's scaled sampling and refraction compositing do not yet match the original.

@@ -74,6 +74,8 @@ Vue **只承担外壳**：组件树、`props`、生命周期，以及一个全�
 
 位移图按 `(宽×高×圆角×折射深度×是否色散)` 做键缓存，相同形状共享一张位图；每帧只改最便宜的 `feDisplacementMap` 的 `scale` 来驱动动画。
 
+同一条链还承载**烘焙 SDF 纹理**的折射（锁屏时钟）：位移图不是从圆角矩形解析求出，而是从纹理的 `r` / `gb` 通道解码得出，形状裁剪用纹理的 alpha 通道做 `mask-image`。见 §9。
+
 ### 3.4 高光系统（highlight-map / interactive-highlight）
 
 上游给 `Default` / `Ambient` 高光建了 **AGSL shader** 并用 `paint.setRuntimeShader` —— 而 Android 的 Paint 会用*颜色 alpha* 调制 shader 输出，于是高光环 alpha = `样式颜色alpha · |⟨SDF外法线, (cos angle, sin angle)⟩| ^ falloff`。
@@ -200,21 +202,7 @@ npm run probe:fidelity    # 13 个目的地的渲染指纹，用于改动前后 
 
 ---
 
-## 6. 移植约定（硬规则）
-
-1. **动画值不进 Vue 响应式**：`animationRevision` 必须是 `ref`；否则整页静默失效。
-2. **`argb()` 收 8 位 ARGB**（`argb(0xff34c759)`），传 6 位 hex 会得到 alpha=0 全透明。
-3. **不传 `highlight`/`shadow` ≠ 关闭**：Kotlin 缺省 = `Highlight.Default` / `Shadow.Default`；缺省 prop 必须回落到默认值（只有 ControlCenter 显式传 `shadow = null`）。
-4. **保持 1:1 移植**，允许的偏离必须在注释里写明理由（如 ControlCenter 的 `onVerticalDrag` 扩展、Magnifier 的 Canvas 2D 重绘段落）。
-5. **不要加原版没有的装饰**：原版全屏铺满、无手机边框/返回胶囊（左上角的 Back 是 skiko 版 `BackHandler` 画出的蓝色 `LiquidButton`，已还原）。
-6. **全局禁止文字选中**：`.app-root` 上 `user-select:none` 等；只有 `input/textarea/[contenteditable]` 保留可选。手势层**不要**用 `preventDefault` 挡选择（会吞掉 `RippleSurface` 依赖的原生 `@click`）。
-7. **按压高光两个分支都要画**，`highlightPosition()` 的第二实参传**指针绝对局部坐标**而非 `offset`（上游 lambda 形参虽叫 `offset`，实际传的是 `positionAnimation.value`）。
-8. **DOM 玻璃里"不该被采样到的东西"**：要么别画在那里，要么自己挖洞；叠一份副本上去没用，原件照样会漏（缩放一个被 clip 过的录制层改变的是形状不是颜色，别随手丢）。
-9. **状态 `fraction` 只读、屏幕位置取动画值**（如 `LiquidToggle` 的 `dampedDragAnimation.value`）；直接读状态会导致"点一下瞬移"而非弹簧滑动。
-
----
-
-## 7. 浏览器兼容性
+## 6. 浏览器兼容性
 
 | 能力 | Chromium（Chrome/Edge 76+） | Safari / Firefox |
 | --- | --- | --- |
@@ -226,11 +214,12 @@ npm run probe:fidelity    # 13 个目的地的渲染指纹，用于改动前后 
 
 ---
 
-## 8. 源码对照表（节选）
+## 7. 源码对照表（节选）
 
 | Web | 上游 Kotlin |
 | --- | --- |
 | `src/core/glass-filter.ts` | `Lens.kt` / `Shaders.kt`（折射、`RoundedRectRefractionShaderString`、`RoundedRectRefractionWithDispersionShaderString`） |
+| `src/core/sdf-texture.ts` | `SdfShader.kt` + `SdfShaderString`（锁屏时钟的烘焙 SDF 纹理；见 §9） |
 | `src/core/highlight-map.ts` | `HighlightStyle.kt`（AGSL `Ambient/Default` shader） |
 | `src/core/backdrop.ts` | `LayerBackdrop` 体系（已退化为 Root/Empty） |
 | `src/components/GlassSurface.vue` | Compose `Modifier` 玻璃链 |
@@ -240,15 +229,57 @@ npm run probe:fidelity    # 13 个目的地的渲染指纹，用于改动前后 
 
 ---
 
-## 9. 已知限制与后续方向
+## 8. 已知限制与后续方向
 
 - 折射在非 Chromium 浏览器上不可用（已降级为纯模糊）。
 - 部分高频滤镜图有 96 张上限的 LRU 缓存（`mapCache`）。
 - 站点若用 CSP 限制 `img-src`（不允许 `data:`），`<feImage>` 的位移图会被拒绝且**完全静默**——详见 [§10](#10-用户脚本liquid-glass-refraction)。
 - 无头环境（`--dump-dom`）会饿死 `rAF`，弹簧动画只出极少帧——验证动画是否在跑应读 inline transform 是否随时间变化，而非看截图。
 - **大面积玻璃仍然昂贵，且代价集中在一处**：每个玻璃表面都要为 `backdrop-filter` 维护一份独立的滤镜图（SDF → 位移图 → `feImage` + `feDisplacementMap`），其中**只有那条 `url(#…)` 位移图在花帧时间**——去掉它，一屏 20 个面就从 8.5 fps 回到 63 fps（与全部隐藏玻璃层同速）。所以约束是**同屏折射面的数量与面积**，不是 JS 或布局；实测、口径与已清掉的浪费见 [§11](#11-性能)。
+- `colorControls` 的 `brightness` 在原版是**加法**（进颜色矩阵的常数项 `t = (0.5 − 0.5c + brightness)·255`），而 CSS 的 `brightness()` 是**乘法**；CSS `contrast(0.75)` 自带的常数 31.875 比原版的 6.375 大 25.5，中灰偏亮约 6%。时钟板已改为在滤镜里用 `feColorMatrix` 精确实现（见 §9），**其余页面仍是 CSS 版**。
 - 后续可探索：把 `glass-filter` 的位移图生成移到 Worker、对非 Chromium 增加 WebGL 折射 fallback（若届时允许引入 WebGL）。
 
+---
+
+## 9. 时钟板：烘焙 SDF 纹理的折射（`LockScreenContent`）
+
+原版锁屏那串 "12:45" 不是文字，是**一张烘焙好的 SDF 纹理**（`clock_sdf`，1599×515），由 `SdfShader.apply(48.dp, 45f)` 上屏。通道约定（权威来自 AGSL 源码 `SdfShaderString`，下表每个数字都是实测的）：
+
+| 通道 | 含义 | 实测 |
+| --- | --- | --- |
+| `r` | 有符号距离 `sd = r/255·2 − 1`，形状外为中性 128 | 形状内占 33.6% |
+| `gb` | 单位法线 `normalize(gb/255·2 − 1)` | remap 后 `\|n\|` 均值 **1.005** |
+| `a` | 形状掩码 `smoothstep(0.5, 1, a)` | 全透明 54.7% / 全不透明 31.2% / 软边 14.1% |
+
+shader 只对 `sd < 0`（内部）生效：`intensity = circleMap(1 − min(1, −sd·1.5))` 在边界处为 1、向内到 `sd = −0.667` 衰减到 0，所以有效折射带是 **R ∈ (42.5, 127.5)** —— 与 `lens()` 的 rim band 同构，只是形状不再是解析的圆角矩形。
+
+Web 侧**不是近似，是三处精确替换**（解码在 `src/core/sdf-texture.ts`，滤镜分支是 `glass-filter.ts` 的 `spec.sdf`）：
+
+| 原版 shader | Web | 为什么成立 |
+| --- | --- | --- |
+| `content.eval(refractedCoord)` | `feDisplacementMap` 读**由纹理解码出的位移图** | 位图格式与 `lens()` 那份完全相同，只换了 `sd` 与法线的来源 |
+| `content.eval(...) * v.a` | lens 上 `mask-image: url(clock_sdf.webp)` | 纹理的 alpha 通道**就是** `v.a`；直指原资源，字形轮廓保持全分辨率 |
+| 两段 `color.rgb *= 1 + k` | 一张 `α` 乘法图 + `feComposite arithmetic k1=1 k3=1` | `k1·map·color + k3·color = color·(1+α)`；两段合并为单个 `1+α`，交叉项恒为 0，故 `α ∈ [0, 0.5]` 不裁切 |
+
+`onDrawBackdrop` 里那层 25% 白走 `feFlood` + `feComposite operator="over"`（`GlassSurface` 的 `backdropWash`），**必须留在滤镜图内**：上游它是被录制进同一个 graphics layer 的，会被 `* v.a` 一起裁进字形；改画到 `onDrawSurface` 就变成盖住整个 400×129 盒子的白矩形。
+
+### 9.1 页级遮罩：`backdropScrim`
+
+整屏压暗的那层 30% 黑（`Column(Modifier.background(Black.copy(0.3f)))`）**不在**板子采样的 backdrop 里：`BackdropDemoScaffold` 把 `layerBackdrop(backdrop)` 只挂在壁纸 `Image` 上，遮罩是它的兄弟节点、绘制在后，而 `LayerBackdropNode.draw()` 录的只有那一个 `drawContent()`。于是原版字形内折射**原始壁纸**（亮）、字形外是被压暗的壁纸（暗）—— 这才是"光透过玻璃雕的字"的来历。
+
+`backdrop-filter` 抓的却是**物理上位于其后的一切**，遮罩在内，字形被压暗两次，整块塌成贴在壁纸上的平涂。既然污染只是一次常数乘法（`rgba(0,0,0,a)` 覆盖 `W` 得 `(1−a)·W`），就可以在采样之后精确除回去：`GlassSurface` 的 `backdropScrim` → `RefractionSpec.backdropGain = 1/(1−a)` → 链首一个**独立**的对角 `feColorMatrix`。
+
+- 必须**最前**：污染在 blur 的输入端，而 blur 是线性的（`blur((1−a)·W) = (1−a)·blur(W)`），所以求逆放在 blur 之后仍然精确。
+- 必须**独立**：wash 是 `over` 合成（要等价需要把系数变成 `0.75/0.7 > 1`，做不到），而更下面的色彩矩阵是 `colorControls` 自己的载体。
+- **不会削顶**：遮罩已把值压到 `≤ 178.5`，乘 `1/0.7` 恰好回到 `≤ 255`；唯一残差是遮罩自身的 8-bit 量化（`≤ 0.7` 码值）。
+- 只有声明过的目的地才生成该图元（`hasGain` 参与图结构的缓存键），其余 12 个目的地图元一个不多。
+
+> ⚠️ **反例别混**：`ControlCenterContent` 的 `dimColor` 语义相反 —— 原版那个 dim 在 `drawWithContent { drawContent(); drawRect(dimColor) }` 里、**位于 `layerBackdrop` 之内**，是**应该**被玻璃采样的。
+
+### 9.2 已知差异
+
+- 时钟是**静态字形**（原版烘的就是 "12:45" 这张纹理，不是走时的钟）。要让它走时，代价按更新频率摊薄：秒针级（每秒 1 次）约 **0.13 ms/帧**，可忽略；每帧动画（数字翻滚）约 **468 ms/秒**，不可行 —— 因为 `feImage` 的 `href` 一换，整条过滤器图就要重新光栅化。
+- `colorControls` 目前只在这条 SDF 路径上进滤镜（`feColorMatrix`）。**其余页面的 brightness 仍是 CSS 的乘法版**，与原版的加法语义差一个常数 25.5 —— 见 [§8](#8-已知限制与后续方向)。
 ---
 
 ## 10. 用户脚本（Liquid Glass Refraction）
@@ -582,5 +613,4 @@ npm run probe:perf
 
 以下组件在当前构建中**尚未完成**（关键逻辑缺失或仅搭出骨架），玻璃效果与原版差距较大，**请勿依赖其表现**：
 
-- **Lock screen / 时钟（`LockScreenContent`）** —— 锁屏可拖拽的 SDF 时钟盘。原版的时钟纹理依赖 `clock_sdf` 资源与 `SdfShader`，当前移植已移除 SDF 相关能力，时钟盘尚未实现完整效果。
 - **Magnifier / 放大镜（`MagnifierContent`）** —— 段落上方可拖拽的透镜，依赖 backdrop 缩放 + 折射链，当前实现尚未完成，透镜的缩放采样与折射合成未达原版表现。
