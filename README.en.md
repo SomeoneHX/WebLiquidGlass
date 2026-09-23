@@ -19,8 +19,6 @@ The goal is not to *look* similar, but to **reproduce, effect-by-effect and pixe
 
 Stack: **Vue 3 + TypeScript + Vite**, managed with `npm`. **Pure DOM + native browser tech; zero WebGL / zero GLSL.**
 
-> ⚠️ Direction note: an earlier plan aimed for a "degraded" form (no blur, no refraction). That was **reversed** — the current build fully uses native CSS/SVG filters for both blur and refraction. This README describes the current build.
-
 ---
 
 ## 2. Relationship to the original
@@ -376,15 +374,13 @@ To regenerate (when upstream `src/core/glass-filter.ts` changes), strip types wi
 ./node_modules/.bin/tsc src/core/glass-filter.ts --target es2022 --module esnext --outDir /tmp/strip
 ```
 
-There are exactly two post-processing steps: drop the **leading** `export ` prefixes (the previous revision had three: `FILTER_PAD` / `isRefractionSupported` / `createGlassFilter`), and the `svgRoot()` line below.
+There are exactly two post-processing steps: drop the **leading** `export ` prefixes (three of them: `FILTER_PAD` / `isRefractionSupported` / `createGlassFilter`), and the `svgRoot()` line below.
 
 **Do not hard-code the line range of section 1** — locate it with the same markers the probe uses: from the nearest preceding `/*` before `/** SVG refraction filter for`, to the nearest preceding `/*` before `* 2. Userscript host`. Before splicing, run **invariant checks** (no surviving leading `export `, the documented `svgRoot()` deviation present, `NEUTRAL_WORD` / `buildMap` / `createGlassFilter` present) and refuse to write if any fails.
 
-⚠️ **Do not self-prove by "the old block == the result of running the same pipeline against HEAD"**: that assertion only holds while the userscript is in sync with `HEAD`. As soon as the core has uncommitted work — the script already carrying the previous revision — it **misreports** and refuses a perfectly correct write. The real verification is `npm run probe:map`, which evaluates the spliced section 1 in Node and fails loudly on a malformed result.
-
 Afterwards, always run: `npm run check:userscript` + `npm run probe:band` + `npm run probe:render`.
 
-⚠️ **The core must not depend on `ctx.canvas`**: `probe:map` evaluates section 1 in Node against a fake DOM whose canvas `getContext()` provides **only** `createImageData` / `putImageData`, with **no `canvas` back-reference**. Reusing the map canvas once produced `ctx.canvas.toDataURL(...)`, which killed `npm run probe:map` outright (`TypeError: ... reading 'toDataURL'`). The fix is to return the **element itself** from the helper rather than going through `ctx`.
+⚠️ **The core must not depend on `ctx.canvas`**: `probe:map` evaluates section 1 in Node against a fake DOM whose canvas `getContext()` provides **only** `createImageData` / `putImageData`, with **no `canvas` back-reference** — `ctx.canvas.toDataURL(...)` kills `npm run probe:map` outright (`TypeError: ... reading 'toDataURL'`). Return the **element itself** from the helper instead of going through `ctx`.
 
 Only **one line** inside section 1 differs from the extraction source: `document.body || document.documentElement` in `svgRoot()`, so it can run before `<body>` exists (which is the case for `@require`).
 
@@ -426,9 +422,9 @@ Three reading notes:
 - The table only reflects **root-path response headers**. A `<meta http-equiv="Content-Security-Policy">`, a policy sent only on some subpaths, or one added after an SPA route change will not show up — **the script's own probe is the authority** (it runs on the real page).
 - A hit looks like "frosted glass, no lens" — it neither draws anything wrong nor reports an error. The single deciding question is whether that `data:` PNG can be decoded.
 
-### 10.9 The displacement zero point, and why it stays at 128
+### 10.9 The displacement zero point: why the content shifts up-left
 
-`feDisplacementMap` computes `scale × (value/255 − 0.5)`, so the exact zero point is **127.5** — which an 8-bit channel cannot express. Writing 128 leaves a constant **+0.5 LSB = +`scale/510` px** on the whole map, sampling toward (+x, +y); the lens content, background included, reads as shifted up-left. Skia's raster path is literally that expression (`src/effects/imagefilters/SkDisplacementMapImageFilter.cpp`):
+`feDisplacementMap` computes `scale × (value/255 − 0.5)`, so the exact zero point is **127.5** — which an 8-bit channel cannot express. Writing 128 leaves a constant **+0.5 LSB = +`scale/510` px** on the whole map, sampling toward (+x, +y): the sample point lands right and below, so the lens content, background included, reads as shifted **up-left**. Skia's raster path is literally that expression (`src/effects/imagefilters/SkDisplacementMapImageFilter.cpp`):
 
 ```cpp
 const SkVector scaleForColor = SkVector::Make(scale.fX * Inv8bit, scale.fY * Inv8bit);
@@ -437,24 +433,14 @@ SkScalar displX = scaleForColor.fX * ex.getX(*displPtr) + scaleAdj.fX;  // = sca
 const int srcX = x + SkScalarTruncToInt(displX);                        // truncation, integer fetch
 ```
 
-**It never reaches the screen.** Measured with a linear-gradient backdrop, 24 000 px averaged (~0.02 px resolution), on the script in this repo (`scale = 2 × amount`):
+**For that constant to reach the screen it first has to survive the rasteriser's rounding.** Measured with a linear-gradient backdrop, 24 000 px averaged (~0.02 px resolution), on the script in this repo (`scale = 2 × amount`):
 
 | amount | ≤126 | 127 | 128 … 382 | 383 … |
 | --- | --- | --- | --- | --- |
 | Constant term (theory) | ≤0.494 | 0.498 | 0.502 … 1.498 | 1.502 … |
 | Measured shift | **0.000 px** | 0.63 px (knife edge, some pixels only) | **1.01 px** | **2.02 px** |
 
-The staircase strides 255 in `amount` (510 in scale), and screenshots inside one plateau are **byte-identical** (scale 255 and 764 render alike; the jump to 2 px starts at 765) — the result is a **whole-pixel staircase**, not a sub-pixel drift that grows with `amount`. Two independent checks say this chain does not interpolate: a 1 px checkerboard backdrop keeps its contrast at every scale (std 110.42 / p2p 255), and screenshots at integer shifts are byte-identical. Residue of this size cannot survive — but **"it cannot survive" is not the same as "the offset is invisible"**: at `amount ≤ 126` the lens interior is pixel-identical, and once `amount` passes 127 **the whole interior translates by one whole pixel and stays there**. No component in the catalog reaches that, **the playground does** — see §10.11.
-
-**So the "dither the neutral point" fix was not adopted** (checkerboarding 127/128 so the mean lands on 127.5). Measured:
-
-| Configuration | Mean shift | Even / odd pixels |
-| --- | --- | --- |
-| Plain 128 @ scale 255 | +1.00 px | uniform (+1.00 / +1.00) |
-| Dithered 127/128 @ scale 255 | +0.50 px | even **0** / odd **+1.00** — half cancelled only |
-| Dithered 127/128 @ scale 510 | −0.003 px | even **−1.00** / odd **+1.00** — mean zero, paid for with a full-card ±1 px checkerboard |
-
-Dithering therefore trades an invisible whole-pixel offset for per-pixel ±1 px sampling jitter, landing in the **interior** of the lens — the one region that is supposed to be an exact identity, the worst place for noise. Note also that `clampByte` is `Math.round` (round-half-up), so `clampByte(128 + (±0.5))` yields {128, 129}, mean **128.5**: measured, that doubles the offset (1.999 px vs 0.999 px at scale 510). If you ever do dither, the base must be `127.5`.
+The staircase strides 255 in `amount` (510 in scale), and screenshots inside one plateau are **byte-identical** (scale 255 and 764 render alike; the jump to 2 px starts at 765) — the result is a **whole-pixel staircase**, not a sub-pixel drift that grows with `amount`. Two independent checks say this chain does not interpolate: a 1 px checkerboard backdrop keeps its contrast at every scale (std 110.42 / p2p 255), and screenshots at integer shifts are byte-identical. A residue in the sub-pixel range produces no visible change, but the offset itself does not vanish: at `amount ≤ 126` the lens interior is pixel-identical, and once `amount` passes 127 **the whole interior translates by one whole pixel and stays there**. No component in the catalog reaches that, **the playground does** — see §10.11.
 
 > A fidelity fact that matters far more than the zero point: Chromium **quantises the displacement to whole pixels and does not interpolate the sample**, whereas the Android original samples at float coordinates — `float2 refractedCoord = coord + d * grad; return content.eval(refractedCoord);` (`RoundedRectRefractionShaderString` in `backdrop/src/commonMain/kotlin/com/kyant/backdrop/internal/Shaders.kt`). The original has neither a zero-point bias nor a quantised field; on the web the rasteriser only moves whole pixels. That is the real fidelity ceiling of this port, and it has nothing to do with the 0.5 LSB term. (§10.10 turns "in this environment" into **"on a real GPU too"**: headless runs through ANGLE Metal on an AMD Radeon RX 570, not a software rasteriser.)
 
@@ -499,7 +485,7 @@ That control row is the invariant: `blur` only touches the backdrop *behind* the
 
 ### 10.11 The whole pixel you can actually see in the playground
 
-§10.9 once claimed "for `amount ≤ 126` the lens interior is pixel-identical — the default 22 *and the entire usable range*". **That holds for the catalog, not for the playground.** `GlassPlaygroundContent` drives `refractionAmountFraction × minDimension` on a `256 × 256` hero card, so `amount` reaches **256** and `scale = 2 × amount` crosses the 255 knife edge at **fraction 0.5**. The offset that "cannot survive" is therefore plain visible there:
+`GlassPlaygroundContent` drives `refractionAmountFraction × minDimension` on a `256 × 256` hero card, so `amount` reaches **256** and `scale = 2 × amount` crosses the 255 knife edge at **fraction 0.5** — the zero-point offset of §10.9 is plainly visible there:
 
 ```
 $ node scripts/refraction-probe.mjs render --probe=shift --bg=noise \
@@ -519,12 +505,6 @@ amount | scale | neutral bias | predicted | sample offset | content shift | rms
 
 So "it looks smooth" and "it is arithmetic on a whole-pixel lattice" are both true: the slider has exactly **three states, 0 → 1 → 2 px**, and **a rigid 1 px step of everything at once has no visible edge** — especially while you are dragging the slider. The impression of a continuously growing pull comes from the rim band (the `rms` 80–90 cells): there the content is pushed outward, growing linearly with `amount`, and on the bottom-right side that reads as being dragged toward the bottom-right corner.
 
-| Fix | Measured outcome | Cost |
-| --- | --- | --- |
-| **Use the B channel as a coverage mask**: encode rim-vs-interior in the unused B, take alpha with `feColorMatrix`, cut the rim out with `feComposite in`, `feComposite over` it back onto `SourceGraphic` | interior pixel-identical at **any** `amount` | 3 extra primitives per surface, inside `glass-filter.ts`'s graph builder |
-| `feOffset` counter-offset (the alternative floated in §10.9) | **Rejected.** At `bias = 1.0000` it does cancel (`rms 0.00`); at `bias = 0.502` it leaves 0.5 px *and* resamples the interior into a 50/50 blend of neighbouring pixels (`rms` **69/255** on a noise backdrop) | trades a 1 px jump for a 0.5 px blur. It does prove something useful, though: **`feOffset` is the only sub-pixel-capable primitive in this chain** |
-| Clamp `refractionAmount` so `2·amount·vmax < 255` | interior constant, one-line change | caps what the playground exists to explore |
-
 ### 10.12 Regression checks: `probe:band` and `probe:fidelity`
 
 §10.10 and §10.11 answer "what does the refraction **look like**". This section answers "**did a change quietly alter it**". The reason is direct: every "same output, less work" optimisation in `glass-filter.ts` — a displacement map that only scans the rim band, writes that are skipped when the value is unchanged, decoration canvases that are not repainted while scrolling — is a claim about **equality**, and no screenshot can substantiate one.
@@ -536,7 +516,7 @@ npm run probe:fidelity    # needs `npm run dev` first; a render fingerprint of 1
 
 **`band`**: `buildMap` no longer walks the whole padded region, only the rows and columns its SDF bound admits. That bound is a product of **reasoning**, and reasoning can be wrong — a band that is too tight silently drops real rim pixels, the refraction goes subtly wrong, and nothing else in the repo notices (the map still encodes, the filter still runs, the tests still pass). So it is checked against a **full scan**: `sdf` / `gradSdf` / `clampByte` come from the shipped core (exposed by `loadCore`), i.e. the oracle re-states **only the part under test — the loop structure** — and not the maths. The neutral word is likewise **read back out of the shipped bitmap** rather than re-declared, so changing it cannot make the two implementations agree on the wrong answer.
 
-12 geometries × spectral branches, compared byte for byte. Both historical bugs are in the script's comments, and both were caught by exactly this check:
+12 geometries × spectral branches, compared byte for byte. There are two easy ways to get that bound wrong, and the script's comments carry one of each:
 
 | Mistake | Consequence |
 | --- | --- |
@@ -593,25 +573,19 @@ Two things fall straight out of it:
 (§10.10 / §10.11 describe what the refraction **looks like**; this section describes what it **costs**.
 Same probe.)
 
-### 11.1 Waste that has been removed
+### 11.1 Doing only what a frame needs
 
-This chain used to run at a few fps on a screen of 20 surfaces, with the main thread sitting empty.
-The work was "same output, less of it" — **nothing was degraded**: refraction stays fully active while
-scrolling.
+This chain only ever does "same output, less of it" — **nothing is degraded**: refraction stays
+fully active while scrolling.
 
-| Where | Before | Now |
-| --- | --- | --- |
-| `glassFilter.update()` | wrote `feDisplacementMap[scale]` on every redraw, though a scroll changes none of its inputs (~1170 writes per scroll), and a filter-primitive write dirties the filter | remember the last value per node and skip it (the `fe writes = 0` column above) |
-| `buildMap` | evaluated the SDF over the **whole padded region** | scans only the rows and columns the bound admits, with one `Uint32Array.fill` for the neutral word; a full-scan oracle over 12 geometries is §10.12 |
-| `MAP_LIMIT` | 32 | 96 (one chromatic-aberration press asks for 18 entries, so 32 evicted its own working set) |
-| `isRefractionSupported()` | read `navigator.userAgentData.brands` once per frame per surface | memoised |
-| `GlassSurface` style writes | rewrote transform / clip-path / mask gradient / `backdrop-filter` on every redraw | skipped when unchanged |
-| the three decoration canvases | repainted on every scroll frame | skipped unless the paint signature moved (the `canvas ops = 154` / 30 frames column) |
-
-The reproducible figures above are the **ratio** (8.5 → 63, 7.4×) and `fe writes = 0`. The absolute
-pre-change numbers (~1170 writes, canvas ops ≈27× higher) were taken at the time with a throwaway
-script on the same machine, interleaved; that script was not kept, so do not quote those as a
-baseline — quote the ratio.
+| Where | What it does |
+| --- | --- |
+| `glassFilter.update()` | remembers the last `feDisplacementMap[scale]` per node and skips a same-value write — a scroll changes none of its inputs (the `fe writes = 0` column above). A filter-primitive write dirties the filter |
+| `buildMap` | scans only the rows and columns the bound admits, with one `Uint32Array.fill` for the neutral word; a full-scan oracle over 12 geometries is §10.12 |
+| `MAP_LIMIT` | 96 (one chromatic-aberration press asks for 18 entries, so 32 evicted its own working set) |
+| `isRefractionSupported()` | memoised |
+| `GlassSurface` style writes | transform / clip-path / mask gradient / `backdrop-filter` skipped when unchanged |
+| the three decoration canvases | skipped unless the paint signature moved (the `canvas ops = 154` / 30 frames column) |
 
 **The other cost**, in the same command's second scene: holding a `Toggle` for 1.5 s rebuilds 15–18
 displacement maps, of which **63–80 ms is inside `canvas.toDataURL`** — a synchronous PNG encode on
@@ -644,7 +618,7 @@ performance work here stays within "rasterise less".
 
 The following components are **known to contain bugs** in the current build; their glass deformation / capture compositing has **not** been verified pixel-correct against the upstream reference. **Do not use in production or rely on their appearance:**
 
-- **Toggle (`LiquidToggle`)** — the thumb's glass deformation (`innerTransform` squash + velocity skew) and the "press-scaled track layer" punch-through (`trackInnerTransform` + `trackClipPath`) are among the most intricate glass effects in the catalog. The scaled track layer was once dropped under the wrong assumption that "a flat colour is scale-invariant" and has since been rebuilt, but it is **still flagged as buggy**; behaviour may diverge from the original (e.g. wrong track scaling / hole misalignment while pressed).
+- **Toggle (`LiquidToggle`)** — the thumb's glass deformation (`innerTransform` squash + velocity skew) and the "press-scaled track layer" punch-through (`trackInnerTransform` + `trackClipPath`) are among the most intricate glass effects in the catalog, and the current implementation does not match the original (e.g. wrong track scaling / hole misalignment while pressed).
 
 > This component is the priority fix target.
 

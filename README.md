@@ -19,8 +19,6 @@
 
 技术栈：**Vue 3 + TypeScript + Vite**，仅用 `npm` 管理。**纯 DOM + 浏览器原生技术，零 WebGL / 零 GLSL。**
 
-> ⚠️ 方向说明：早期版本曾计划做"降级形态"（无模糊、无折射）。该方向已被**推翻**——当前实现完整使用浏览器 CSS / SVG 滤镜实现模糊与折射。本 README 描述的就是当前这一版。
-
 ---
 
 ## 2. 与原版的关系
@@ -376,15 +374,13 @@ npm run dev                 # 浏览器里验证（把脚本粘进测试页即�
 ./node_modules/.bin/tsc src/core/glass-filter.ts --target es2022 --module esnext --outDir /tmp/strip
 ```
 
-后处理只有两步：去掉**行首**的 `export ` 前缀（旧版恰好 3 处：`FILTER_PAD` / `isRefractionSupported` / `createGlassFilter`），以及下面那一行 `svgRoot()`。
+后处理只有两步：去掉**行首**的 `export ` 前缀（`FILTER_PAD` / `isRefractionSupported` / `createGlassFilter` 三处），以及下面那一行 `svgRoot()`。
 
 **定位第 1 段不要写死行号**，用与探针相同的标记：从 `/** SVG refraction filter for` 之前最近的 `/*`，到 `* 2. Userscript host` 之前最近的 `/*`。拼接前先做**不变量检查**（无残留的行首 `export `、含 `svgRoot()` 那条 deviation、含 `NEUTRAL_WORD` / `buildMap` / `createGlassFilter`），不等就拒绝写入。
 
-⚠️ **不要用"旧块 == 对 HEAD 跑一遍同样流程的结果"来自证**：那条断言只在"用户脚本与 `HEAD` 同步"时成立。核心一旦有未提交的改动（脚本里已经是上一轮的版本），它会**误报**并拒绝一次本来正确的写入。真正的验证交给 `npm run probe:map`——它在 Node 里求值拼好的第 1 段，格式一坏就报错。
-
 改完必须跑：`npm run check:userscript` + `npm run probe:band` + `npm run probe:render`。
 
-⚠️ **核心不许依赖 `ctx.canvas`**：`probe:map` 会在 Node 里用一套假 DOM 求值第 1 段，其假 canvas 的 `getContext()` 只提供 `createImageData` / `putImageData`，**没有 `canvas` 反向引用**。曾经为了复用画布写成 `ctx.canvas.toDataURL(...)`，直接把 `npm run probe:map` 打挂（`TypeError: ... reading 'toDataURL'`）。正确做法是让 helper 返回**元素本身**，而不是绕道 `ctx`。
+⚠️ **核心不许依赖 `ctx.canvas`**：`probe:map` 在 Node 里用一套假 DOM 求值第 1 段，其假 canvas 的 `getContext()` 只提供 `createImageData` / `putImageData`，**没有 `canvas` 反向引用**——`ctx.canvas.toDataURL(...)` 会直接把 `npm run probe:map` 打挂（`TypeError: ... reading 'toDataURL'`）。helper 返回**元素本身**即可，不要绕道 `ctx`。
 
 第 1 段内只有**一行**与提取源不同：`svgRoot()` 里 `document.body || document.documentElement`，以便在 `<body>` 存在之前执行（`@require` 就是这种情况）。
 
@@ -426,9 +422,9 @@ npm run dev                 # 浏览器里验证（把脚本粘进测试页即�
 - 上表只看**根路径响应头**。`<meta http-equiv="Content-Security-Policy">` 形式、只对部分子路径下发的 CSP、以及 SPA 路由切换后新增的策略都看不到——**以脚本自己的探针为准**（它就在真实页面上跑）。
 - 命中时的表现是"磨砂正常、透镜没有"，不会画错也不会报错；判断依据只有一个：位移图那张 `data:` PNG 能不能被解码。
 
-### 10.9 位移的零点与量化：为什么中性值是 128 而不是 127.5
+### 10.9 位移的零点与量化：内容为什么往左上偏
 
-`feDisplacementMap` 的偏移是 `scale × (value/255 − 0.5)`，精确零点落在 **127.5**，8 位通道表达不了它。写 128 时整幅位移图带一个常数项 **+0.5 LSB = +`scale/510` px**，取样方向朝 (+x, +y)，看起来就是透镜里的内容（含背景）整体往左上偏。Skia 的光栅实现就是这条式子（`src/effects/imagefilters/SkDisplacementMapImageFilter.cpp`）：
+`feDisplacementMap` 的偏移是 `scale × (value/255 − 0.5)`，精确零点落在 **127.5**，8 位通道表达不了它。写 128 时整幅位移图带一个常数项 **+0.5 LSB = +`scale/510` px**，取样方向朝 (+x, +y)——取样点偏右偏下，透镜里的内容（含背景）就整体往**左上**偏。Skia 的光栅实现就是这条式子（`src/effects/imagefilters/SkDisplacementMapImageFilter.cpp`）：
 
 ```cpp
 const SkVector scaleForColor = SkVector::Make(scale.fX * Inv8bit, scale.fY * Inv8bit);
@@ -437,24 +433,14 @@ SkScalar displX = scaleForColor.fX * ex.getX(*displPtr) + scaleAdj.fX;  // = sca
 const int srcX = x + SkScalarTruncToInt(displX);                        // 截断 + 整数取样
 ```
 
-**但它落不到屏上。** 线性渐变背景 + 2.4 万像素平均（位移分辨率 ≈0.02 px）实测本仓库脚本（`scale = 2 × amount`）：
+**这个常数项要落到屏上，得先过光栅器的取整。** 线性渐变背景 + 2.4 万像素平均（位移分辨率 ≈0.02 px）实测本仓库脚本（`scale = 2 × amount`）：
 
 | amount | ≤126 | 127 | 128 … 382 | 383 … |
 | --- | --- | --- | --- | --- |
 | 常数项（理论） | ≤0.494 | 0.498 | 0.502 … 1.498 | 1.502 … |
 | 实测位移 | **0.000 px** | 0.63 px（刀口，仅部分像素） | **1.01 px** | **2.02 px** |
 
-台阶步长 255（按 scale 折算 510），且同一台阶内的截图**逐字节相同**（scale 255 与 764 渲染一致，765 起跳到 2 px）——渲染结果是**整像素阶梯**，不是随 amount 线性增长的亚像素漂移。两条独立证据说明这条链没有插值：1 px 棋盘背景在任何 scale 下对比度都不变（std 110.42 / p2p 255）；整数位移的截图逐字节相同。亚像素量级的残差落不了屏——但**"落不了屏"不等于"偏移看不见"**：`amount ≤ 126` 时透镜内部与背景逐像素相同，`amount` 越过 127 之后**整个内部会整体平移 1 个整像素并从此保持**。目录里没有任何组件能到这个量级，**游乐场能**——见 §10.11。
-
-**因此没有采用"抖动中性点"的修法**（在 127/128 之间棋盘抖动，让均值落在 127.5）。实测：
-
-| 配置 | 均值位移 | 奇 / 偶像素 |
-| --- | --- | --- |
-| 纯 128 @ scale 255 | +1.00 px | 均匀（+1.00 / +1.00） |
-| 抖动 127/128 @ scale 255 | +0.50 px | 偶 **0** / 奇 **+1.00** —— 只抵消一半 |
-| 抖动 127/128 @ scale 510 | −0.003 px | 偶 **−1.00** / 奇 **+1.00** —— 均值归零，代价是全场 ±1 px 棋盘 |
-
-即抖动把"看不见的整像素偏移"换成"逐像素 ±1 px 取样抖动"，而落点正是**玻璃内部**——那里本该是严格恒等，是整块玻璃最不该出现噪声的地方。另外 `clampByte` 是 `Math.round`（round-half-up），写成 `clampByte(128 + (±0.5))` 得到的是 {128, 129}、均值 **128.5**：实测偏置翻倍（scale 510 下 1.999 px vs 0.999 px）。真要抖动，基数必须是 `127.5`。
+台阶步长 255（按 scale 折算 510），且同一台阶内的截图**逐字节相同**（scale 255 与 764 渲染一致，765 起跳到 2 px）——渲染结果是**整像素阶梯**，不是随 amount 线性增长的亚像素漂移。两条独立证据说明这条链没有插值：1 px 棋盘背景在任何 scale 下对比度都不变（std 110.42 / p2p 255）；整数位移的截图逐字节相同。亚像素量级的残差在屏上看不出变化，但偏移本身没有消失：`amount ≤ 126` 时透镜内部与背景逐像素相同，`amount` 越过 127 之后**整个内部会平移 1 个整像素并从此保持**。目录里没有任何组件能到这个量级，**游乐场能**——见 §10.11。
 
 > 一个比零点项重要得多的保真度事实：本环境下 Chromium 把位移**量化到整像素、取样不插值**，而 Android 原版的 AGSL 是在浮点坐标上取样的——`float2 refractedCoord = coord + d * grad; return content.eval(refractedCoord);`（`backdrop/src/commonMain/kotlin/com/kyant/backdrop/internal/Shaders.kt` 的 `RoundedRectRefractionShaderString`）。原版既无零点偏差、位移场也是连续的；web 端受光栅器限制只能整像素跳。这才是这次移植的真实保真度上限，与 0.5 LSB 的零点项无关。（§10.10 的探针把这条从"本环境如此"坐实为**真 GPU 上同样如此**：headless 走的是 ANGLE Metal / AMD Radeon RX 570，不是软件光栅器。）
 
@@ -499,7 +485,7 @@ node scripts/refraction-probe.mjs render --bg=checker --blur=1   # 位移前 blu
 
 ### 10.11 游乐场里能看见的那个整像素：中性 128 的偏置什么时候才够得着
 
-§10.9 一度写过"`amount ≤ 126` 时透镜内部逐像素不变（默认 22 就是整个可用范围）"——**这句只对目录成立，游乐场不成立**。`GlassPlaygroundContent` 的旋钮是 `refractionAmountFraction × minDimension`，hero 卡是 `256 × 256`，所以 `amount` 一路到 **256**，`scale = 2 × amount` 在 **fraction 0.5** 就跨过 255 这条刀口。于是那个"落不了屏"的偏置，在游乐场里是**看得见的**：
+`GlassPlaygroundContent` 的旋钮是 `refractionAmountFraction × minDimension`，hero 卡是 `256 × 256`，所以 `amount` 一路到 **256**，`scale = 2 × amount` 在 **fraction 0.5** 就跨过 255 这条刀口——§10.9 那条零点偏置在这里是**看得见的**：
 
 ```
 $ node scripts/refraction-probe.mjs render --probe=shift --bg=noise \
@@ -519,12 +505,6 @@ amount | scale | neutral bias | predicted | sample offset | content shift | rms
 
 所以"看起来是平滑的"和"算术上是整像素"可以同时成立：整个滑块行程里只有 **0 → 1 → 2 三个状态**，而**整体一起跳 1 px 是看不出台阶的**——尤其在你正拖着滑块的时候。真正在"越拉越偏"的那种连续感，来自边框带（rms 80–90 的那些格子），那圈内容被往外推、幅度随 `amount` 线性增长，右下角那一侧看起来就是往右下角被拽。
 
-| 修法 | 实测结果 | 取舍 |
-| --- | --- | --- |
-| **B 通道当遮罩**：把"边框/内部"编进没用到的 B，`feColorMatrix` 取 alpha + `feComposite in` 切出边框 + `feComposite over` 压回 `SourceGraphic` | 内部在**任意** `amount` 下逐像素恒等 | 每个表面多 3 个原语；改动落在 `glass-filter.ts` 的图构建里 |
-| `feOffset` 反向补偿（§10.9 提过的备选） | **否决**。`bias = 1.0000` 时确实抵消（rms 0.00）；`bias = 0.502` 时残留 0.5 px 且内部被插值成相邻像素的 50/50 混合（噪声背景下 rms **69/255**） | 拿"1 px 整跳"换"0.5 px 模糊"，不值；但它证明了一件有用的事——**`feOffset` 是这条链里唯一能亚像素定位的原语** |
-| 把 `refractionAmount` 夹到 `2·amount·vmax < 255` | 内部恒定，一行改动 | 等于给游乐场的探索范围封顶 |
-
 ### 10.12 回归验证：`probe:band` 与 `probe:fidelity`
 
 §10.10 / §10.11 的两条口径回答"折射**看起来**是什么"，这一节的两条回答"**改动有没有偷偷改变它**"。加它们的原因很直接：`glass-filter.ts` 里所有"同输出、少做事"的优化——只扫描边缘带的位移图、跳过同值写入、滚动时不重绘装饰画布——都是关于**等价性**的断言，而没有任何一张截图能证明它们。
@@ -536,7 +516,7 @@ npm run probe:fidelity    # 需要先 `npm run dev`；13 个目的地 × 7 个�
 
 **`band`**：`buildMap` 不再遍历整个 padded 区域，只走它的 SDF 边界允许的行列。这条边界是**推理**的产物，而推理会错——带取窄了就会静默丢掉真实边缘像素，折射微妙地失真，而仓库里其它任何东西都发现不了（图照编、滤镜照跑、测试照过）。所以它拿一个**全扫描**做对照：`sdf` / `gradSdf` / `clampByte` 都取自已提交的核心（由 `loadCore` 暴露），即**只重述被测试的那部分——循环结构**，不重述数学。中性灰也一样，是**从已提交的位图里读回来**的，不是另写一遍常量，所以改了中性值也不会让两边在错误答案上"达成一致"。
 
-12 种几何 × 光谱分支逐字节比对。两个历史上的真 bug 都写进了脚本注释，也正是这个检查抓出来的：
+12 种几何 × 光谱分支逐字节比对。这条边界有两种容易写错的方式，脚本注释里各留了一条：
 
 | 错误 | 后果 |
 | --- | --- |
@@ -583,20 +563,18 @@ npm run probe:perf
 
 （§10.10 / §10.11 讲折射**看起来**是什么，这里讲它**花多少**——共用同一套探针。）
 
-### 11.1 已经清掉的浪费
+### 11.1 每帧只做必要的事
 
-这一链早先在一屏 20 个面上只有 3 fps 量级，而主线程是空的。优化只做"同一输出、少做事"，**没有任何降级**：滚动时折射照常全速运行。
+这一链只做"同一输出、少做事"，**没有任何降级**：滚动时折射照常全速运行。
 
-| 位置 | 原来 | 现在 |
-| --- | --- | --- |
-| `glassFilter.update()` | 每次 redraw 都写 `feDisplacementMap[scale]`——而滚动时该值每帧完全相同（一次滚动约 1170 次写入），写过滤器图元属性又会让过滤器失效 | 按节点记住上次的值，同值跳过（上表 `fe 写入 = 0`） |
-| `buildMap` | 对**整个 padded 区域**求 SDF | 只扫描边界允许的行列，中性灰一次 `Uint32Array.fill` 写入；12 种几何的全扫描对照见 §10.12 |
-| `MAP_LIMIT` | 32 | 96（一次带色散的按压就要 18 个条目，32 会把自己淘汰掉） |
-| `isRefractionSupported()` | 每帧每面读 `navigator.userAgentData.brands` | 记忆化 |
-| `GlassSurface` 的样式写入 | 每次 redraw 都重写 transform / clip-path / 遮罩梯度 / `backdrop-filter` | 同值跳过 |
-| 三层装饰画布 | 每个滚动帧都重绘 | 绘制签名不变则跳过（上表 `画布操作 = 154` / 30 帧） |
-
-上表能复跑的口径是那个**比值**（8.5 → 63，7.4×）与 `fe 写入 = 0`。改前的绝对数字（约 1170 次写入、画布操作约 27× 于现在）是当时用临时脚本在同一台机器上同轮交错测的，脚本没有入仓——所以别把那些数当基线引用，把比值当基线。
+| 位置 | 做法 |
+| --- | --- |
+| `glassFilter.update()` | 按节点记住上次的 `feDisplacementMap[scale]`，同值不写——滚动时该值每帧完全相同（上表 `fe 写入 = 0`）。写过滤器图元属性会让过滤器失效 |
+| `buildMap` | 只扫描边界允许的行列，中性灰一次 `Uint32Array.fill` 写入；12 种几何的全扫描对照见 §10.12 |
+| `MAP_LIMIT` | 96（一次带色散的按压就要 18 个条目，32 会把自己淘汰掉） |
+| `isRefractionSupported()` | 记忆化 |
+| `GlassSurface` 的样式写入 | transform / clip-path / 遮罩梯度 / `backdrop-filter` 同值跳过 |
+| 三层装饰画布 | 绘制签名不变则跳过（上表 `画布操作 = 154` / 30 帧） |
 
 **按压的另一处代价**（同一命令的第二个场景）：`Toggle` 按住 1.5 s 会重建 15–18 张位移图，其中 **63–80 ms 花在 `canvas.toDataURL`**——主线程上的同步 PNG 编码。它分散在按压动画的十几帧里，所以帧率看不出问题（§10.12 的 `fidelity` 也不受影响），但它确实是这块屏按下时唯一接近"卡一下"的地方。要再降只有两条路，都属取舍：把编码挪出帧（`OffscreenCanvas.convertToBlob` + `URL.createObjectURL` 异步回写 `href`，但 `blob:` 的 CSP 接受面比 `data:` 窄，会影响用户脚本在部分站点的可用性），或按 `refractionHeight` 预生成阶梯。
 
@@ -612,7 +590,7 @@ npm run probe:perf
 
 以下组件在当前构建中**已知存在问题**，其玻璃形变 / 捕获合成尚未达到与原版一致的像素级正确度，**请勿用于生产或依赖其表现**：
 
-- **Toggle（开关，`LiquidToggle`）** —— 拇指玻璃的形变（`innerTransform` 的 squash + 速度倾斜）与"按压缩小轨道层"的挖洞合成（`trackInnerTransform` + `trackClipPath`）是全目录最复杂的玻璃效果之一。该组件的缩放轨道层曾被误判"纯色缩放不变"而整体丢弃，当前虽已重做，但**仍被标记为存在 bug**，表现可能偏离原版（如按压时轨道缩放 / 挖洞错位）。
+- **Toggle（开关，`LiquidToggle`）** —— 拇指玻璃的形变（`innerTransform` 的 squash + 速度倾斜）与"按压缩小轨道层"的挖洞合成（`trackInnerTransform` + `trackClipPath`）是全目录最复杂的玻璃效果之一，当前实现与原版不一致（如按压时轨道缩放 / 挖洞错位）。
 
 > 该组件是后续重点修复对象。
 
