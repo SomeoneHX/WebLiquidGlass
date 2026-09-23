@@ -615,9 +615,9 @@ userscript's arbitrary-site case.
 
 ## ⚠️ Known Bugs (current build)
 
-The following components are **known to contain bugs** in the current build; their glass deformation / capture compositing has **not** been verified pixel-correct against the upstream reference. **Do not use in production or rely on their appearance:**
+The following components are **known to contain bugs** in the current build; they do not match the upstream reference. **Do not use in production or rely on their appearance:**
 
-- **Toggle (`LiquidToggle`)** — the thumb's glass deformation (`innerTransform` squash + velocity skew) and the "press-scaled track layer" punch-through (`trackInnerTransform` + `trackClipPath`) are among the most intricate glass effects in the catalog, and the current implementation does not match the original (e.g. wrong track scaling / hole misalignment while pressed).
+- **Toggle (`LiquidToggle`)** — while pressed, the thumb's glass is meant to see a *scaled copy* of the track, so the real track drawn underneath is punched out along the thumb's outline (`trackClipPath` subtracts a reversed `thumbHolePath` from `TRACK_OUTLINE` under the nonzero rule). The hole is a `clip-path` and its edge is anti-aliased: partially covered pixels still carry track colour, the glass samples them along with everything else, and a ring of residue is left along the thumb's edge.
 
 > This component is the priority fix target.
 
@@ -625,6 +625,6 @@ The following components are **known to contain bugs** in the current build; the
 
 ## 🚧 Not yet implemented (current build)
 
-The following components are **not yet complete** in the current build (key logic missing or only a skeleton in place); their glass effects differ substantially from the original, so **do not rely on their appearance:**
+The following components are **not yet complete** in the current build; their glass does not match the original, so **do not rely on their appearance:**
 
-- **Magnifier (`MagnifierContent`)** — the draggable lens over a paragraph, built on backdrop scaling + a refraction chain. The current implementation is incomplete; the lens's scaled sampling and refraction compositing do not yet match the original.
+- **Magnifier (`MagnifierContent`)** — the lens magnifies what sits **behind the lens itself** (`backdrop-zoom` takes 1.5× about the lens centre), whereas the original magnifies the region **around the cursor**: the lens floats 80 dp above the cursor, and `withTransform { scale(1.5f); translate(top = -80f.dp.toPx()) }` inside `onDrawBackdrop` lands the magnified content on the cursor — the magnified cursor included. `backdrop-filter` only samples pixels inside the element's own rect, so what the web build shows under the lens is a different piece of content.
