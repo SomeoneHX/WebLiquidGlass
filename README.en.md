@@ -609,8 +609,7 @@ screen, or smaller ones), not from faster JS. The other obvious route — droppi
 and painting the backdrop yourself — would recover the magnitude, but it requires the application to
 know what the backdrop *is*, and the entire point of `backdrop` is refracting what is **genuinely
 behind** it (§3.3), not the application's own wallpaper; it also does not carry over to the
-userscript's arbitrary-site case. **This project therefore does not take that route**, and the
-performance work here stays within "rasterise less".
+userscript's arbitrary-site case.
 
 ---
 
