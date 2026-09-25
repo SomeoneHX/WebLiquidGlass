@@ -198,6 +198,8 @@ npm run probe:fidelity    # 13 个目的地的渲染指纹，用于改动前后 
 
 `density = 1`，所以 Kotlin 里的 `xx.dp` 常量 1:1 映射成 CSS `px`，不做任何换算。
 
+用浏览器的三个模式（`probe:render` / `probe:fidelity` / `probe:perf`）自己找 Chromium：在 `~/.agent-browser`、playwright 与 puppeteer 的版本缓存里按版本从新到旧找，也可以用 `CHROME_PATH` 指定。
+
 ---
 
 ## 6. 浏览器兼容性
@@ -549,6 +551,8 @@ npm run probe:perf
 ```
 
 口径：`ScrollContainer` 的 20 条整宽玻璃行，**每帧推进一次滚动**、共 30 帧。这个定义很关键——滚动只在产出帧时才前进，**所以滚完所用的时间就是帧预算**。若改成"一个时间窗里出了多少帧"，慢的构建会把整窗都花在滚动上、快的提前滚完然后空转，反而把慢的那一侧说得好听。每档跑 3 遍取中位数，极差一并打印。
+
+测试机：**Intel Xeon E3-1230 v2（8 线程）+ AMD Radeon RX 570**，macOS 15.7.5 上的 headless Chromium（ANGLE Metal，与 `probe:render` 打印的 rasteriser 同一台）。
 
 | 状态 | fps（3 遍） | 滚完耗时 | 主线程占用 | 过滤器属性写入 | 画布操作 |
 | --- | --- | --- | --- | --- | --- |

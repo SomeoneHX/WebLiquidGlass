@@ -198,6 +198,10 @@ npm run probe:fidelity    # render fingerprint of 13 destinations, for A/B acros
 
 `density = 1`, so Kotlin `xx.dp` constants map 1:1 to CSS `px` with no conversion.
 
+The three browser-driving modes (`probe:render` / `probe:fidelity` / `probe:perf`) find their own
+Chromium — newest-first through the version caches of `~/.agent-browser`, playwright and puppeteer —
+or take one via `CHROME_PATH`.
+
 ---
 
 ## 6. Browser compatibility
@@ -553,6 +557,9 @@ frame**, 30 frames. That definition is load-bearing — the scroll only advances
 produced, **so the time the scroll takes is the frame budget**. Measured as "frames in a time window"
 instead, a slow build spends the whole window scrolling while a fast one finishes early and idles,
 which flatters the wrong side. Three passes per state, median reported, spread printed too.
+
+Test machine: **Intel Xeon E3-1230 v2 (8 threads) + AMD Radeon RX 570**, headless Chromium on
+macOS 15.7.5 — the same ANGLE Metal rasteriser `probe:render` prints.
 
 | state | fps (3 passes) | scroll took | main thread | filter attr writes | canvas ops |
 | --- | --- | --- | --- | --- | --- |
