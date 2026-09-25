@@ -34,7 +34,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { accessSync, constants, mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -42,13 +42,87 @@ import zlib from 'node:zlib'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const USERSCRIPT = join(ROOT, 'userscript', 'liquid-glass-refract.user.js')
-const CHROME =
-  process.env.CHROME_PATH ??
-  join(
-    process.env.HOME,
-    'Library/Caches/ms-playwright/chromium-1234/chrome-mac-x64/' +
-      'Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'
-  )
+
+/** `Google Chrome for Testing`, `Chromium` and plain `Chrome` all use `<App>.app/Contents/MacOS/<bin>`. */
+const MAC_APPS = [
+  'Google Chrome for Testing',
+  'Chromium',
+  'Google Chrome',
+  'Google Chrome Canary'
+]
+
+/** Every file name a cache entry can hold a browser under, relative to its version directory. */
+const CACHED_BINARIES = [
+  ...MAC_APPS.map((app) => `${app}.app/Contents/MacOS/${app}`),
+  ...['chrome-mac-arm64', 'chrome-mac-x64', 'chrome-mac'].flatMap((arch) =>
+    MAC_APPS.map((app) => `${arch}/${app}.app/Contents/MacOS/${app}`)
+  ),
+  'chrome-linux64/chrome',
+  'chrome-linux/chrome',
+  'chrome'
+]
+
+/** Browsers installed as applications or system packages, tried after the caches. */
+const SYSTEM_CHROME = [
+  ...MAC_APPS.map((app) => `/Applications/${app}.app/Contents/MacOS/${app}`),
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/snap/bin/chromium'
+]
+
+/**
+ * The browser that `render` / `fidelity` / `perf` drive, resolved on first use so the pure-Node
+ * modes (`map`, `band`) need no browser at all. `CHROME_PATH` wins; otherwise the version caches
+ * are searched newest-first. The headless *shell* builds are skipped on purpose — they are a
+ * different compositor, and measuring them would change what the numbers mean.
+ */
+let resolvedChrome = null
+function chromePath() {
+  if (resolvedChrome) return resolvedChrome
+  const explicit = process.env.CHROME_PATH
+  if (explicit) {
+    if (!isExecutable(explicit)) throw new Error(`CHROME_PATH is not executable: ${explicit}`)
+    return (resolvedChrome = explicit)
+  }
+
+  const home = process.env.HOME ?? ''
+  const caches = [
+    join(home, '.agent-browser', 'browsers'),
+    join(home, 'Library/Caches', 'ms-playwright'),
+    join(home, '.cache', 'ms-playwright'),
+    join(home, '.cache', 'puppeteer', 'chrome')
+  ]
+  const found = caches
+    .flatMap((root) => versionDirs(root).flatMap((dir) => CACHED_BINARIES.map((rel) => join(dir, rel))))
+    .concat(SYSTEM_CHROME)
+    .find(isExecutable)
+
+  if (!found) throw new Error('no Chromium found — set CHROME_PATH to one')
+  return (resolvedChrome = found)
+}
+
+/** Version directories of a cache root, newest first; a missing root is not an error. */
+function versionDirs(root) {
+  try {
+    return readdirSync(root)
+      .sort()
+      .reverse()
+      .map((entry) => join(root, entry))
+  } catch {
+    return []
+  }
+}
+
+function isExecutable(path) {
+  try {
+    accessSync(path, constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
 
 /* ------------------------------------------------------------------------------------------- */
 /* PNG decode (8-bit truecolour, non-interlaced) — enough for a CDP screenshot                   */
@@ -441,7 +515,7 @@ async function onceChrome({ headed, gpu }, fn) {
   if (gpu) flags.push('--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist')
   // `detached` puts the browser and every helper it spawns in one process group, so a single
   // kill cleans up the whole tree — Chrome's launcher is not the process that holds the port.
-  const child = spawn(CHROME, flags, { stdio: 'ignore', detached: true })
+  const child = spawn(chromePath(), flags, { stdio: 'ignore', detached: true })
   let wsUrl = null
   for (let i = 0; i < 100 && !wsUrl; i++) {
     await new Promise((r) => setTimeout(r, 100))
@@ -1058,9 +1132,9 @@ function runBand() {
  * destination, so two builds can be compared field by field:
  *
  *   npm run dev                                               # in another terminal
- *   node scripts/refraction-probe.mjs fidelity --write=/tmp/base.json
+ *   node scripts/refraction-probe.mjs fidelity --write=base.json
  *   ...make a change...
- *   node scripts/refraction-probe.mjs fidelity --baseline=/tmp/base.json
+ *   node scripts/refraction-probe.mjs fidelity --baseline=base.json
  *
  * It is an A/B tool rather than a pass/fail gate: the hashes cover *map bytes*, so they are stable
  * across runs of the same build (verified) but tied to the renderer version, so a browser update

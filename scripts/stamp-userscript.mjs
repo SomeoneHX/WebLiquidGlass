@@ -10,7 +10,7 @@
  * version, and this script is the only place the two are allowed to differ.
  *
  * Usage (CI):    node scripts/stamp-userscript.mjs <run-number> dist/liquid-glass-refract.user.js
- * Usage (local): node scripts/stamp-userscript.mjs 0 /tmp/liquid-glass-refract.user.js
+ * Usage (local): node scripts/stamp-userscript.mjs 0 dist/liquid-glass-refract.user.js
  *
  * The stamped version is `<base major.minor>.<run-number>`: base `0.2.0` + run `37` -> `0.2.37`.
  * Both carriers of the version (the metadata line and `const VERSION`) are rewritten, and the
@@ -20,7 +20,8 @@
  */
 import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const [runNumber, outPath] = process.argv.slice(2)
 if (!runNumber || !outPath) {
@@ -28,7 +29,8 @@ if (!runNumber || !outPath) {
   process.exit(2)
 }
 
-const SOURCE = resolve('userscript/liquid-glass-refract.user.js')
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
+const SOURCE = join(ROOT, 'userscript', 'liquid-glass-refract.user.js')
 const source = readFileSync(SOURCE, 'utf8')
 
 const versionLine = /^(\/\/ @version\s+)(\S+)\s*$/m
