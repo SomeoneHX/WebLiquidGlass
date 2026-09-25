@@ -57,6 +57,17 @@ function pickImage() {
   fileInput.value?.click()
 }
 
+/**
+ * The sheet drag is attached to the wrapper, i.e. to an *ancestor* of the picker, and it calls
+ * `setPointerCapture` on itself — which overrides the capture the button took for its own press
+ * tracking. The button then never receives `pointerup`: its press animation stays at 1 and no
+ * click is emitted. Stopping the `pointerdown` here keeps the pointer with the button, the way
+ * the original keeps the button above the wallpaper's `draggable` in hit-test order.
+ */
+function onPickerPointerDown(event: PointerEvent): void {
+  event.stopPropagation()
+}
+
 function onFileChange(event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
@@ -122,6 +133,7 @@ defineExpose({ el: wrapper, backdrop: RootBackdrop, wallpaper: imageEl })
       :style="pickerStyle"
       :backdrop="RootBackdrop"
       tint="#0088FF"
+      @pointerdown="onPickerPointerDown"
       @click="pickImage"
     >
       <span class="scaffold__picker-label">Pick an image</span>
