@@ -620,6 +620,29 @@ userscript's arbitrary-site case.
 
 ---
 
+## ⚠️ Caveats (host page constraints)
+
+These are not implementation defects in this library but inherent constraints of `backdrop-filter` and `mix-blend-mode` in browsers. If the host page violates them, the glass is "still there but no longer refracting" — check these first when debugging.
+
+### A glass surface must not sit inside a `position: fixed` container
+
+The `additive` layer uses `mix-blend-mode: plus-lighter` (the CSS twin of `BlendMode.Plus`). `mix-blend-mode` needs an isolated group to define what it blends with, and the boundary of that group is its **nearest stacking context ancestor** — which is also a backdrop root, so `backdrop-filter` can sample no further than it.
+
+`position: fixed` **always** creates a stacking context, independently of `z-index`. Once a glass surface is wrapped in a `fixed` container, its `lens` can only sample that container's own contents (the glass itself), and the `url()` refraction stops working.
+
+- Symptom: the glass keeps its CSS blur but loses the edge bend; the `LiquidBottomTabs` indicator degenerates into a flat grey pill.
+- Fix: to pin the glass to the viewport, use `position: absolute` inside a container that does not scroll and does not itself create a stacking context — and do not give it a `z-index`, which would create one again.
+
+### A glass ancestor must not clip with rounded corners
+
+An ancestor with `overflow: hidden` (or `clip`) combined with a non-zero `border-radius` makes Chromium skip the SVG-filter half of `backdrop-filter`, and the `lens` samples nothing. A square clip is not affected: setting the radius to 0 while keeping the clip restores it.
+
+### Nested glass belongs in a sibling layer of the surface
+
+`GlassSurface`'s content layer carries the shape's `clip-path`, and a clipped ancestor cuts off a nested glass's backdrop capture. Put the inner glass alongside the outer surface, layered on top (which is how the `LiquidBottomTabs` indicator does it), or under an ancestor that does not clip.
+
+---
+
 ## ⚠️ Known Bugs (current build)
 
 The following components are **known to contain bugs** in the current build; they do not match the upstream reference. **Do not use in production or rely on their appearance:**

@@ -590,6 +590,29 @@ npm run probe:perf
 
 ---
 
+## ⚠️ 注意事项（宿主页面的约束）
+
+以下几条不是本库的实现缺陷，而是 `backdrop-filter` 与 `mix-blend-mode` 在浏览器里的固有约束。宿主页面若不符合这些条件，玻璃会"看着还在、其实已经不折射了"——排查时请先核对这几条。
+
+### 玻璃面不能放在 `position: fixed` 的容器里
+
+`additive` 层用 `mix-blend-mode: plus-lighter`（`BlendMode.Plus` 的 CSS 等价物）。`mix-blend-mode` 需要一个隔离组来界定它与什么混合，隔离组的边界是它**最近的 stacking context 祖先**，而这个边界同时是 backdrop root —— `backdrop-filter` 的采样范围正止于此。
+
+`position: fixed` **无条件**创建 stacking context（与 `z-index` 无关）。因此玻璃面一旦被 `fixed` 容器包住，`lens` 的 `backdrop-filter` 只能采到该容器内部（只有玻璃自己），`url()` 折射不再生效。
+
+- 表现：玻璃只剩 CSS 模糊、没有边缘弯折；`LiquidBottomTabs` 的指示器退化成一块恒定灰药丸。
+- 做法：要固定在视口，改用 `position: absolute` 放进一个不滚动、且自身不创建 stacking context 的容器 —— **不要给它 `z-index`**，`z-index` 会重新创建。
+
+### 玻璃的祖先不能带圆角裁切
+
+`overflow: hidden`（或 `clip`）**加上**非零 `border-radius` 的祖先，会让 Chromium 跳过 `backdrop-filter` 的 SVG 滤镜那条路，`lens` 采不到任何背景。直角裁切不受影响：只把圆角置 0、保留裁切即可恢复。
+
+### 嵌套玻璃要放在玻璃面的兄弟层
+
+`GlassSurface` 的 content 层带有形状的 `clip-path`，被裁切的祖先会截断内层玻璃的 backdrop 捕获。内层玻璃应与外层玻璃面**平级**叠在上面（`LiquidBottomTabs` 的指示器即如此），或放在一个不受裁切的祖先下。
+
+---
+
 ## ⚠️ 已知 Bug（当前构建）
 
 以下组件在当前构建中**已知存在问题**，其表现与原版不一致，**请勿用于生产或依赖其表现**：
