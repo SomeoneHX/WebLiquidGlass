@@ -68,7 +68,7 @@ Why split highlights across two canvases? Because **Canvas cannot do "addition"*
 
 - The displacement map is built on a Canvas from a rounded-rect **SDF** (isomorphic to Android's `RoundedRectRefractionShaderString`);
 - `feDisplacementMap` reads a map where **R = dx, G = dy** (128 = no offset) and shifts each pixel by it;
-- **Chromatic aberration**: the upstream shader samples the backdrop 7 times along the refraction offset with spectral weights. Here a **three-branch filter graph** is used instead — red `base·(1+i)`, green `base`, blue `base·(1−i)`, each displaced and re-added with `feComposite arithmetic` (3 taps instead of 7; white is conserved).
+- **Chromatic aberration**: the upstream shader samples the backdrop 7 times along the refraction offset with spectral weights (`Shaders.kt:125–155`). All 7 taps are kept here: a **seven-branch filter graph** — one displacement map `base·(1+k·i)` per tap (`k ∈ {1, 2/3, …, −1}`), one `feColorMatrix` spectral-weight matrix per tap, chained additions via `feComposite arithmetic` (each channel's weights sum to exactly 1; white is conserved).
 
 Maps are memoised by `(width × height × corner-radii × refraction-depth × chromatic?)`, so identical shapes share one bitmap; per frame only the cheap `feDisplacementMap` `scale` is updated to drive the animation.
 
@@ -352,7 +352,7 @@ Options accepted by `apply`:
 | `refractionHeight` | `18` | How far in from the rim the bend reaches (px) |
 | `refractionAmount` | `22` | Largest displacement at the rim (px); feeds `feDisplacementMap@scale` directly |
 | `depthEffect` | `true` | Blend the centripetal direction into the bend gradient |
-| `chromaticAberration` | `false` | Three-branch dispersion: 3 displacement maps + an 11-primitive filter graph |
+| `chromaticAberration` | `false` | Seven-branch dispersion: 7 displacement maps + a 28-primitive filter graph |
 | `maxArea` | `490000` | Area ceiling; above it the element is skipped with a warning (the SDF is per-pixel, per-branch, and janks the main thread on large elements) |
 
 ### 10.5 Before you use it
@@ -399,7 +399,7 @@ Both merges are **syntactically valid** — `node --check`, and any parser, cann
 
 | Item | Result |
 | --- | --- |
-| Filter graph | 11 primitives, `scale 94.9 ｜ 52 ｜ 94.9`, `filterUnits=userSpaceOnUse`, `color-interpolation-filters=sRGB` |
+| Filter graph | 28 primitives, per-branch `scale 80.3 ｜ 68.2 ｜ 56.1 ｜ 44 ｜ 56.1 ｜ 68.2 ｜ 80.3` (scaleBase = refractionHeight 22), `filterUnits=userSpaceOnUse`, `color-interpolation-filters=sRGB` |
 | Displacement map | 448×308 (= element + `FILTER_PAD`×2), 17328 rim px of 137984, max deviation 111/127, `data:` URL ≈23 KB |
 | Does refraction reach the screen | Changing only `refractionAmount` 0 → 34: 11995 px differ, maxdelta 77, diff bbox exactly the element box; differences are **entirely at inset ≤ 19px**, 0 px deeper than 20px, 0 px outside the box |
 | CSP `img-src 'none'` | Maps refused (a `securitypolicyviolation` with `img-src`, one per map), `refractionAmount` 0→30 gives **0 px**; against a plain `blur()` control on the same page **0 px of 57600**, i.e. "frosted glass with no lens" |
@@ -589,7 +589,7 @@ fully active while scrolling.
 | --- | --- |
 | `glassFilter.update()` | remembers the last `feDisplacementMap[scale]` per node and skips a same-value write — a scroll changes none of its inputs (the `fe writes = 0` column above). A filter-primitive write dirties the filter |
 | `buildMap` | scans only the rows and columns the bound admits, with one `Uint32Array.fill` for the neutral word; a full-scan oracle over 12 geometries is §10.12 |
-| `MAP_LIMIT` | 96 (one chromatic-aberration press asks for 18 entries, so 32 evicted its own working set) |
+| `MAP_LIMIT` | 96 (one chromatic-aberration press asks for 42 entries, so 32 evicted its own working set) |
 | `isRefractionSupported()` | memoised |
 | `GlassSurface` style writes | transform / clip-path / mask gradient / `backdrop-filter` skipped when unchanged |
 | the three decoration canvases | skipped unless the paint signature moved (the `canvas ops = 154` / 30 frames column) |

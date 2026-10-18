@@ -68,7 +68,7 @@ Vue **只承担外壳**：组件树、`props`、生命周期，以及一个全�
 
 - 位移图在 Canvas 上按圆角矩形 **SDF** 生成（与 Android `RoundedRectRefractionShaderString` 同构）；
 - `feDisplacementMap` 读取一张图，其中 **R = dx、G = dy**（128 = 不偏移），据此移动每个像素；
-- **色散（chromatic aberration）**：上游 shader 沿折射偏移采样 7 次、带频谱权重。这里改用**三分支滤镜图**——红 `base·(1+i)`、绿 `base`、蓝 `base·(1−i)`，分别位移后 `feComposite arithmetic` 相加（3 次采样而非 7 次，白光守恒）。
+- **色散（chromatic aberration）**：上游 shader 沿折射偏移采样 7 次、带频谱权重（`Shaders.kt:125–155`）。这里保留全部 7 个 tap：**七分支滤镜图**——每 tap 一张位移图 `base·(1+k·i)`（`k ∈ {1, 2/3, …, −1}`）、一个 `feColorMatrix` 频谱权重矩阵，`feComposite arithmetic` 链式相加（各通道权重和恰为 1，白光守恒）。
 
 位移图按 `(宽×高×圆角×折射深度×是否色散)` 做键缓存，相同形状共享一张位图；每帧只改最便宜的 `feDisplacementMap` 的 `scale` 来驱动动画。
 
@@ -350,7 +350,7 @@ window.LiquidGlassRefractConfig = {
 | `refractionHeight` | `18` | 从边缘向内多深开始弯曲（px） |
 | `refractionAmount` | `22` | 边缘最大位移（px），直接进 `feDisplacementMap@scale` |
 | `depthEffect` | `true` | 把向心方向混进弯折梯度 |
-| `chromaticAberration` | `false` | 三分支色散：3 张位移图 + 11 段滤镜图 |
+| `chromaticAberration` | `false` | 七分支色散：7 张位移图 + 28 段滤镜图 |
 | `maxArea` | `490000` | 面积上限，超过则跳过并 warn（SDF 逐像素逐分支，大元素会卡主线程） |
 
 ### 10.5 使用前须知
@@ -397,7 +397,7 @@ npm run dev                 # 浏览器里验证（把脚本粘进测试页即�
 
 | 项 | 结果 |
 | --- | --- |
-| 滤镜图 | 11 个 primitive，`scale 94.9 ｜ 52 ｜ 94.9`，`filterUnits=userSpaceOnUse`、`color-interpolation-filters=sRGB` |
+| 滤镜图 | 28 个 primitive，7 个分支 `scale 80.3 ｜ 68.2 ｜ 56.1 ｜ 44 ｜ 56.1 ｜ 68.2 ｜ 80.3`（scaleBase = refractionHeight 22），`filterUnits=userSpaceOnUse`、`color-interpolation-filters=sRGB` |
 | 位移图 | 448×308（= 元素 + `FILTER_PAD`×2），rim 17328 / 137984 px，最大偏差 111/127，`data:` URL ≈23 KB |
 | 折射是否上屏 | 仅把 `refractionAmount` 从 0 改到 34：11995 px 不同、maxdelta 77、差异 bbox 恰为元素框；差异**全在 inset ≤ 19px**，≥20px 深 0 px、框外 0 px |
 | CSP `img-src 'none'` | 位移图被拒（`securitypolicyviolation: img-src`，每个 map 一次），`refractionAmount` 0→30 **0 px 差异**；与同页纯 `blur()` 控制组相比 **0 px / 57600**，即"只剩磨砂、没有透镜" |
@@ -575,7 +575,7 @@ npm run probe:perf
 | --- | --- |
 | `glassFilter.update()` | 按节点记住上次的 `feDisplacementMap[scale]`，同值不写——滚动时该值每帧完全相同（上表 `fe 写入 = 0`）。写过滤器图元属性会让过滤器失效 |
 | `buildMap` | 只扫描边界允许的行列，中性灰一次 `Uint32Array.fill` 写入；12 种几何的全扫描对照见 §10.12 |
-| `MAP_LIMIT` | 96（一次带色散的按压就要 18 个条目，32 会把自己淘汰掉） |
+| `MAP_LIMIT` | 96（一次带色散的按压就要 42 个条目，32 会把自己淘汰掉） |
 | `isRefractionSupported()` | 记忆化 |
 | `GlassSurface` 的样式写入 | transform / clip-path / 遮罩梯度 / `backdrop-filter` 同值跳过 |
 | 三层装饰画布 | 绘制签名不变则跳过（上表 `画布操作 = 154` / 30 帧） |

@@ -18,14 +18,21 @@
  * ## Chromatic aberration
  *
  * The AGSL dispersion shader (`RoundedRectRefractionWithDispersionShaderString`) samples
- * the backdrop 7 times along the refraction offset with spectral weights. `feDisplacementMap`
- * displaces every channel by the *same* vector, so the port bakes the spectral split into
- * three displacement maps — red `base·(1+i)`, green `base`, blue `base·(1−i)` where
- * `i = cx·cy/(hw·hh)` is the shader's `dispersionIntensity` (zero on the axes, strongest in
- * two opposite quadrants) — displaces a channel-isolated copy of the backdrop with each, and
- * re-adds the branches with `feComposite arithmetic`. Three taps instead of seven: the
- * cross-channel bleed of the middle spectral bands is dropped, which at a few px of
- * dispersion is visually indistinguishable, and white is conserved either way.
+ * the backdrop 7 times along the refraction offset with spectral weights:
+ *
+ * ```
+ * tap_k = content.eval(refractedCoord + dispersedCoord · k)
+ * k ∈ {1, 2/3, 1/3, 0, −1/3, −2/3, −1},   dispersedCoord = d·grad·i
+ * i = cx·cy/(hw·hh)   (zero on the axes, strongest in two opposite quadrants)
+ * ```
+ *
+ * Each tap is folded in with its own channel weights (`Shaders.kt:125–155`): red `R/3.5`,
+ * orange `R/3.5 + G/7`, yellow `R/3.5 + G/3.5`, green `G/3.5`, cyan `G/3.5 + B/3`,
+ * blue `B/3`, purple `R/7 + B/3`. Each channel's weights sum to exactly 1, so white is
+ * conserved and the seven premultiplied results can be added without clipping. The port keeps
+ * all seven taps: seven displacement maps `base·(1 + k·i)`, one `feColorMatrix` weight matrix
+ * per tap (alpha passthrough — see `feSpectralElement` for why `A/7` cannot go in the matrix),
+ * and six `feComposite arithmetic` additions — 28 primitives.
  *
  * The `chromaticAberration` uniform is a *boolean* upstream (`Lens.kt` passes a constant
  * `1f`), so the dispersion field depends only on geometry and bakes into the maps; the
@@ -155,7 +162,7 @@ export interface RefractionSpec {
   refractionHeight: number
   /** `depthEffect` — blend the centripetal direction into the gradient (Shaders.kt:117). */
   depthEffect?: boolean
-  /** `chromaticAberration` — bake the spectral split, use the three-branch filter graph. */
+  /** `chromaticAberration` — bake the spectral split, use the seven-tap filter graph. */
   chromaticAberration?: boolean
   /**
    * When set, the displacement map is decoded from this baked texture instead of being built
@@ -260,12 +267,29 @@ const mapCache = new Map<string, MapEntry>()
 /**
  * Entries are keyed by `(round(width) × round(height), corner radii, round(refractionHeight),
  * flags, branch)`, and a single animated call site walks several `refractionHeight` values — a
- * Toggle press with chromatic aberration alone can want 6 geometries × 3 branches = 18 entries.
+ * Toggle press with chromatic aberration alone can want 6 geometries × 7 branches = 42 entries.
  * At 32 the cache evicted its own working set mid-gesture, so every press re-ran the whole
  * build + PNG encode instead of hitting. Raising the limit is pure caching: nothing about the
  * rendered result changes, only whether a rebuild happens. Entries are a few tens of kB each.
  */
 const MAP_LIMIT = 96
+
+/**
+ * The dispersion taps, in `Shaders.kt`'s order: `m = falloff · (1 + k·i)` per tap, and the
+ * spectral weights that fold each displaced copy into the sum. `feDisplacementMap` displaces
+ * every channel by the same vector, so the split is baked into one map per tap.
+ */
+const DISPERSION_BRANCHES = [1, 2 / 3, 1 / 3, 0, -1 / 3, -2 / 3, -1]
+/** Per tap: `[R, G, B]` weights — the `color.c += tap.c / n` lines of `Shaders.kt:125–155`. */
+const DISPERSION_WEIGHTS: ReadonlyArray<readonly [number, number, number]> = [
+  [1 / 3.5, 0, 0], // red
+  [1 / 3.5, 1 / 7, 0], // orange
+  [1 / 3.5, 1 / 3.5, 0], // yellow
+  [0, 1 / 3.5, 0], // green
+  [0, 1 / 3.5, 1 / 3], // cyan
+  [0, 0, 1 / 3], // blue
+  [1 / 7, 0, 1 / 3] // purple
+]
 
 /**
  * Neutral grey = "leave this pixel alone", as one 32-bit word instead of four byte writes per
@@ -291,7 +315,7 @@ const OPAQUE_BLACK_WORD = (() => {
   return probe[0] === 0x04 ? 0xff000000 : 0x000000ff
 })()
 
-function mapKey(spec: RefractionSpec, branch: 1 | 0 | -1): string {
+function mapKey(spec: RefractionSpec, branch: number): string {
   // The SDF field is baked into the texture, so neither `refractionHeight` (a scale) nor
   // `lightAngle` (bevel only) can change it — only the box and the texture can. Keeping the
   // rounded-rect key shape here would rebuild the bitmap on every step of an animation that
@@ -389,12 +413,13 @@ function mapCanvas(width: number, height: number): HTMLCanvasElement {
 }
 
 /**
- * One displacement-map bitmap. `branch` selects the spectral copy: `+1` red (`base·(1+i)`),
- * `0` green (`base`), `-1` blue (`base·(1−i)`). Encoded magnitudes are normalised to the
- * branch's own maximum so the 8-bit channel never clips (red/blue reach `2·base` at a sharp
- * corner); the lost factor is restored exactly by a per-branch `scale`.
+ * One displacement-map bitmap. `branch` is the tap's dispersion factor `k`: the encoded field is
+ * `falloff · (1 + k·dispersionIntensity)` — `+1` red (`base·(1+i)`), `0` green (`base`), `−1`
+ * purple on the blue axis, and the four intermediate taps in between. Encoded magnitudes are
+ * normalised to the branch's own maximum so the 8-bit channel never clips (`|k| = 1` reaches
+ * `2·base` at a sharp corner); the lost factor is restored exactly by a per-branch `scale`.
  */
-function buildMap(spec: RefractionSpec, branch: 1 | 0 | -1): MapEntry {
+function buildMap(spec: RefractionSpec, branch: number): MapEntry {
   const w = Math.max(1, Math.round(spec.width))
   const h = Math.max(1, Math.round(spec.height))
   const cw = w + FILTER_PAD * 2
@@ -572,7 +597,7 @@ function buildMap(spec: RefractionSpec, branch: 1 | 0 | -1): MapEntry {
 }
 
 /** Displacement map for `spec` and spectral `branch`, memoised — identical shapes share one bitmap. */
-function refractionMap(spec: RefractionSpec, branch: 1 | 0 | -1): MapEntry {
+function refractionMap(spec: RefractionSpec, branch: number): MapEntry {
   const key = mapKey(spec, branch)
   const hit = mapCache.get(key)
   if (hit !== undefined) return hit
@@ -675,7 +700,7 @@ function sdfIntensity(sdf: SdfSource, tx: number, ty: number): number {
  * that the field is only non-neutral where `intensity > 0` — a thin band inside the glyph edges.
  * The whole build is memoised on `(box, texture)`, and for a clock face neither ever changes.
  */
-function buildSdfMap(spec: RefractionSpec, branch: 1 | 0 | -1): MapEntry {
+function buildSdfMap(spec: RefractionSpec, branch: number): MapEntry {
   const sdf = spec.sdf as SdfSource
   const w = Math.max(1, Math.round(spec.width))
   const h = Math.max(1, Math.round(spec.height))
@@ -942,19 +967,32 @@ function feDisplacementElement(input: string, map: string, result?: string): SVG
   return el
 }
 
-/** Keeps one channel (and the alpha) of its input — the branch splitter of the CA graph. */
-function feChannelElement(input: string, channel: 'r' | 'g' | 'b', result: string): SVGFEColorMatrixElement {
+/**
+ * Folds its input into the dispersion sum with one tap's spectral weights — a diagonal 4×5
+ * matrix — diagonal weight rows `[R, G, B]` with an alpha passthrough.
+ * Operates on non-premultiplied colour like any `feColorMatrix`, and the output is
+ * premultiplied by the *output* alpha — so the alpha row must stay a passthrough: writing the
+ * AGSL `A/7` there would scale every tap's colour by 1/7 as well and the seven-way sum would
+ * land at one-seventh brightness. With the passthrough each tap contributes `c·w·a` and the
+ * sum is `a·Σw = a` exactly, white conserved; the re-addition's alpha clamps at 1, which for
+ * the opaque backdrops every call site has equals the AGSL `a/7` accumulation.
+ */
+function feSpectralElement(
+  input: string,
+  weights: readonly [number, number, number],
+  result: string
+): SVGFEColorMatrixElement {
   const el = document.createElementNS(SVG_NS, 'feColorMatrix')
   el.setAttribute('in', input)
   el.setAttribute('type', 'matrix')
-  const row = channel === 'r' ? '1 0 0 0 0' : channel === 'g' ? '0 1 0 0 0' : '0 0 1 0 0'
-  const zero = '0 0 0 0 0'
-  const r = channel === 'r' ? row : zero
-  const g = channel === 'g' ? row : zero
-  const b = channel === 'b' ? row : zero
-  // Alpha passes through: the backdrop behind the glass is opaque, so the re-addition's
-  // alpha clamp at 1 reproduces the source alpha exactly.
-  el.setAttribute('values', `${r}  ${g}  ${b}  0 0 0 1 0`)
+  const fmt = (v: number): string => String(Math.round(v * 1e6) / 1e6)
+  const rows = [
+    `${fmt(weights[0])} 0 0 0 0`,
+    `0 ${fmt(weights[1])} 0 0 0`,
+    `0 0 ${fmt(weights[2])} 0 0`,
+    `0 0 0 1 0`
+  ]
+  el.setAttribute('values', rows.join('  '))
   el.setAttribute('result', result)
   return el
 }
@@ -1068,7 +1106,7 @@ function feColorControlsValues(brightness: number, contrast: number, saturation:
  * {@link refractionMap}; only the tiny `<filter>` element is per-surface, which is what
  * lets two thumbs animate to different refraction strengths at the same time. Surfaces
  * without chromatic aberration keep the two-primitive graph; asking for CA rebuilds it as
- * the eleven-primitive three-branch one.
+ * the twenty-eight-primitive seven-tap one.
  */
 export function createGlassFilter(): GlassFilterHandle {
   const id = `lg-refract-${++sequence}`
@@ -1221,21 +1259,31 @@ export function createGlassFilter(): GlassFilterHandle {
       mapKeys.push(null)
       nodes.push(map, displace)
     } else {
-      const mapR = feImageElement('mapR')
-      const mapG = feImageElement('mapG')
-      const mapB = feImageElement('mapB')
-      const srcR = feChannelElement(chainInput, 'r', 'srcR')
-      const srcG = feChannelElement(chainInput, 'g', 'srcG')
-      const srcB = feChannelElement(chainInput, 'b', 'srcB')
-      const dispR = feDisplacementElement('srcR', 'mapR', 'dispR')
-      const dispG = feDisplacementElement('srcG', 'mapG', 'dispG')
-      const dispB = feDisplacementElement('srcB', 'mapB', 'dispB')
-      const addRG = feAddElement('dispR', 'dispG', 'rg')
-      const addRGB = feAddElement('rg', 'dispB', refracted)
-      maps.push(mapR, mapG, mapB)
-      displacements.push(dispR, dispG, dispB)
-      mapKeys.push(null, null, null)
-      nodes.push(mapR, mapG, mapB, srcR, srcG, srcB, dispR, dispG, dispB, addRG, addRGB)
+      // Seven taps: one displacement map per spectral branch (all reading the same source),
+      // one weight matrix per tap, then a chain of six additions. Each map gets its own
+      // `vmax`-normalised bitmap — `|k| = 1` reaches `2·base` at a sharp corner, the
+      // intermediate taps land between — so `href` and `scale` are per-branch throughout.
+      const srcs: SVGFEColorMatrixElement[] = []
+      const dispEls: SVGFEDisplacementMapElement[] = []
+      for (let t = 0; t < DISPERSION_BRANCHES.length; t++) {
+        const map = feImageElement(`map${t}`)
+        const src = feSpectralElement(chainInput, DISPERSION_WEIGHTS[t], `src${t}`)
+        const disp = feDisplacementElement(`src${t}`, `map${t}`, `disp${t}`)
+        maps.push(map)
+        displacements.push(disp)
+        mapKeys.push(null)
+        srcs.push(src)
+        dispEls.push(disp)
+        nodes.push(map, src, disp)
+      }
+      let sum = 'disp0'
+      for (let t = 1; t < DISPERSION_BRANCHES.length; t++) {
+        const last = t === DISPERSION_BRANCHES.length - 1
+        const result = last ? refracted : `sum${t}`
+        const add = feAddElement(sum, `disp${t}`, result)
+        nodes.push(add)
+        if (result) sum = result
+      }
     }
 
     // `SdfShader`'s bevel, applied to the refracted result and therefore last in the graph.
@@ -1349,15 +1397,15 @@ export function createGlassFilter(): GlassFilterHandle {
         }
       }
 
-      // One resolution per branch per update: `maps` and `displacements` are index-aligned with
-      // `branches`, so the `href`s and the `scale`s are read off the same entries.
-      const branches: (1 | 0 | -1)[] = ca ? [1, 0, -1] : [0]
+      // One resolution per tap per update: `maps` and `displacements` are index-aligned with
+      // `DISPERSION_BRANCHES`, so the `href`s and the `scale`s are read off the same entries.
+      const branches = ca ? DISPERSION_BRANCHES : [0]
       const entries = branches.map((branch) => refractionMap(spec, branch))
 
-      const key = mapKey(spec, ca ? 1 : 0)
+      const key = mapKey(spec, ca ? DISPERSION_BRANCHES[0] : 0)
       if (key !== lastMapKey) {
         lastMapKey = key
-        // Red and blue share the green branch's geometry, so one key guards all three hrefs.
+        // All taps share the green tap's geometry, so one key guards every href.
         maps.forEach((map, index) => {
           const entry = entries[index]
           if (entry.url && mapKeys[index] !== key) {
