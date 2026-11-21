@@ -237,7 +237,7 @@ Refraction (`url()` inside `backdrop-filter`) is a **Chromium extension**. There
 - High-frequency filter maps are capped by a 96-entry LRU cache (`mapCache`).
 - If a site's CSP restricts `img-src` (no `data:`), the `<feImage>` displacement maps are refused and it fails **completely silently** — see [§10](#10-userscript-liquid-glass-refraction).
 - Headless environments (`--dump-dom`) starve `rAF`, so spring animations emit only a few frames — verify "is the animation running" by checking whether the inline transform changes over time, not by screenshots.
-- **Large-area glass is still expensive, and the cost sits in one place**: every glass surface maintains its own filter graph for `backdrop-filter` (SDF → displacement map → `feImage` + `feDisplacementMap`), and **only the `url(#…)` displacement graph spends frame time** — drop it and 20 surfaces go from 8.5 fps to 63 fps, the same speed as hiding every glass layer. The constraint is therefore the **count and area of refractive surfaces on screen**, not JS or layout; measurements, definition and the waste already removed are in [§11](#11-performance).
+- **Frame time is no longer set by the glass**: a screen of 20 full-width refractive surfaces scrolls at 63 fps, the same speed as hiding every glass layer ([§11](#11-performance)). The cost moved to how the shape is expressed — a surface carrying both `clip-path` and `backdrop-filter: url(#…)` is pushed back onto CPU rasterisation and drops to 8.3 fps for the same graph and the same pixels; the contour has to be `border-radius`.
 - Upstream's `colorControls` `brightness` is **additive** (it lands in the colour matrix's constant term, `t = (0.5 − 0.5c + brightness)·255`) while CSS `brightness()` is **multiplicative**; CSS `contrast(0.75)` carries a constant of 31.875 against upstream's 6.375, so mid-grey reads about 6% bright. The clock plate now implements it exactly in the filter with `feColorMatrix` (see §9); **every other page still uses the CSS form**.
 - Future: move `glass-filter` map generation into a Worker; add a WebGL refraction fallback for non-Chromium (if WebGL is permitted at that point).
 
@@ -358,7 +358,7 @@ Options accepted by `apply`:
 ### 10.5 Before you use it
 
 - **You must supply the tint yourself**: the script does not touch the element's own styles, so the element needs a translucent background (e.g. `background: rgba(255,255,255,.16)`) — otherwise you get the lens without the frosted colour;
-- **Shape is `border-radius`**: the corner radius is read from computed style, so for a capsule write `border-radius: 50%` or a large radius; the displacement map is generated from the same geometry;
+- **Shape is `border-radius`**: the corner radius is read from computed style, so for a capsule write `border-radius: 50%` or a large radius; the displacement map is generated from the same geometry. **Do not clip this element with `clip-path`** — together with `url()` it pushes the surface back onto CPU rasterisation (63.3 → 8.3 fps), and the map still follows `border-radius`, so the bend would not follow that clip either;
 - **Chromium only**: Safari / Firefox drop the whole declaration containing `url()`; the script writes plain blur for those engines;
 - **CSP is a hard gate**: if the page restricts `img-src` and disallows `data:`, the displacement maps are refused without an error (one `securitypolicyviolation` per `<feImage>`, but nothing in the console); the script detects this with a 1×1 PNG probe, degrades every surface to plain frosted glass, and `console.warn`s the reason. **What a refusal leaves on screen is pixel-identical to a plain `blur()` control** (measured 0 px of 57600), so what you lose is the lens itself plus the wasted SDF/PNG work — not a drawing error. Which sites actually hit this: see [§10.8](#108-measured-real-world-csp-spread);
 - **Ancestors cut off the backdrop**: any ancestor with `filter` / `opacity < 1` / `mask` becomes a backdrop root, and the glass can only sample what is inside it;
@@ -561,21 +561,27 @@ which flatters the wrong side. Three passes per state, median reported, spread p
 Test machine: **Intel Xeon E3-1230 v2 (8 threads) + AMD Radeon RX 570**, headless Chromium on
 macOS 15.7.5 — the same ANGLE Metal rasteriser `probe:render` prints.
 
-| state | fps (3 passes) | scroll took | main thread | filter attr writes | canvas ops |
-| --- | --- | --- | --- | --- | --- |
-| as shipped | **8.5** (6.9–9.2) | 3531 ms | 2.9% | **0** | 154 |
-| `url(#…)` dropped, `blur/saturate/brightness` kept | **63** (62–63.1) | 476 ms | 17.1% | 0 | 154 |
-| every glass layer hidden | **63** (62.9–63.7) | 476 ms | 13.3% | 0 | 154 |
+As shipped: **63.3 fps** (63.1–63.5 over 3 passes), 474 ms to finish the scroll, 17.7% main thread,
+0 filter-attribute writes, 154 canvas ops. Dropping `url(#…)` down to `blur/saturate/brightness`, or
+hiding every glass layer, is not any faster — the three states now run at the same speed, and the
+frame budget on this page is no longer set by the glass. The probe is a regression instrument from
+here on: anything that pushes a surface back onto CPU rasterisation drops that row to the 8 fps range.
 
-Two things fall straight out of it:
+What sets the frame rate is not the number or area of surfaces but **how the shape is expressed**.
+Same surface, same filter graph, same pixels:
 
-1. **The entire frame cost is the SVG displacement graph.** Dropping `url(#…)` runs at exactly the
-   same speed as hiding the glass layers (63 = 63, both 476 ms) — plain
-   `blur() saturate() brightness()` is **essentially free** at this size and count.
-2. **Low fps next to low main-thread time means rasterisation, not JS.** The shipped row uses 2.9% of
-   the main thread and still only manages 8.5 fps, while the two 63 fps rows report *higher* main-thread
-   shares (in the teens) because their wall clock is short and the same JS is divided by a smaller
-   denominator. Any guess of the form "the JS must be too slow" is settled by those two columns.
+| shape | fps |
+| --- | --- |
+| `border-radius` | 63.3 |
+| `clip-path: path(…)` | 8.3 |
+
+`clip-path` is a non-rectangular clip, so the compositor cannot treat the surface as a filtered quad
+and the whole thing falls back to the CPU image-filter path at raster time: every surface is
+rasterised in software, every frame. Whether the GPU is there makes no difference to that — with the
+clip in place, disabling the GPU only moves 8.3 to 5.4 because both were already on the CPU; without
+it, 63.3 against 13.4 is what the GPU shader is worth. So the contour of a glass surface is always
+`border-radius` (`GlassSurface` writes `shape.cornerRadii`); irregular outlines belong in
+`mask-image`, which does not trigger the fallback.
 
 (§10.10 / §10.11 describe what the refraction **looks like**; this section describes what it **costs**.
 Same probe.)
@@ -587,12 +593,12 @@ fully active while scrolling.
 
 | Where | What it does |
 | --- | --- |
-| `glassFilter.update()` | remembers the last `feDisplacementMap[scale]` per node and skips a same-value write — a scroll changes none of its inputs (the `fe writes = 0` column above). A filter-primitive write dirties the filter |
+| `glassFilter.update()` | remembers the last `feDisplacementMap[scale]` per node and skips a same-value write — a scroll changes none of its inputs (the `fe writes = 0` number above). A filter-primitive write dirties the filter |
 | `buildMap` | scans only the rows and columns the bound admits, with one `Uint32Array.fill` for the neutral word; a full-scan oracle over 12 geometries is §10.12 |
 | `MAP_LIMIT` | 96 (one chromatic-aberration press asks for 42 entries, so 32 evicted its own working set) |
 | `isRefractionSupported()` | memoised |
-| `GlassSurface` style writes | transform / clip-path / mask gradient / `backdrop-filter` skipped when unchanged |
-| the three decoration canvases | skipped unless the paint signature moved (the `canvas ops = 154` / 30 frames column) |
+| `GlassSurface` style writes | transform / border-radius / mask gradient / `backdrop-filter` skipped when unchanged |
+| the three decoration canvases | skipped unless the paint signature moved (`canvas ops = 154` / 30 frames) |
 
 **The other cost**, in the same command's second scene: holding a `Toggle` for 1.5 s rebuilds 15–18
 displacement maps, of which **63–80 ms is inside `canvas.toDataURL`** — a synchronous PNG encode on
@@ -603,26 +609,11 @@ frame (`OffscreenCanvas.convertToBlob` + `URL.createObjectURL`, writing `href` w
 but `blob:` is accepted by fewer CSPs than `data:`, which costs the userscript usable sites), or
 pre-generate a ladder per `refractionHeight`.
 
-### 11.2 What is not solved
-
-The `url(#…)` displacement map is re-rasterised by the browser every frame, and **that scale is not
-negotiable**: 8.5 fps is the current price, 63 fps is the price of not refracting. The count and area
-of refractive surfaces on screen is therefore a hard budget. `FILTER_PAD` (a global 64) makes the
-filter region larger than the element itself — a 1408×160 row is rasterised as 1536×288 — so
-shrinking it per surface buys some back, but not a different order of magnitude.
-
-Any further headroom on this carrier comes from **rasterising less** (fewer refractive surfaces on
-screen, or smaller ones), not from faster JS. The other obvious route — dropping `backdrop-filter`
-and painting the backdrop yourself — would recover the magnitude, but it requires the application to
-know what the backdrop *is*, and the entire point of `backdrop` is refracting what is **genuinely
-behind** it (§3.3), not the application's own wallpaper; it also does not carry over to the
-userscript's arbitrary-site case.
-
 ---
 
 ## ⚠️ Caveats (host page constraints)
 
-These are not implementation defects in this library but inherent constraints of `backdrop-filter` and `mix-blend-mode` in browsers. If the host page violates them, the glass is "still there but no longer refracting" — check these first when debugging.
+These are not implementation defects in this library but inherent constraints of `backdrop-filter` and `mix-blend-mode` in browsers. If the host page violates them, the glass is "still there but no longer refracting", or the picture is right while the whole surface falls back to CPU rasterisation — slow, not wrong. Check these first when debugging.
 
 ### A glass surface must not sit inside a `position: fixed` container
 
@@ -636,6 +627,17 @@ The `additive` layer uses `mix-blend-mode: plus-lighter` (the CSS twin of `Blend
 ### A glass ancestor must not clip with rounded corners
 
 An ancestor with `overflow: hidden` (or `clip`) combined with a non-zero `border-radius` makes Chromium skip the SVG-filter half of `backdrop-filter`, and the `lens` samples nothing. A square clip is not affected: setting the radius to 0 while keeping the clip restores it.
+
+### A glass surface must not be clipped by `clip-path`
+
+`clip-path` together with `backdrop-filter: url(…)` stops the surface from compositing as a filtered
+quad, and the whole thing falls back to the CPU image-filter path at raster time: every surface
+rasterised in software, every frame. Same filter graph, same pixels: `border-radius` 63.3 fps,
+`clip-path: path(…)` 8.3 fps ([§11](#11-performance)).
+
+- Symptom: the picture is exactly right, just slow; with only a few surfaces it is nearly invisible.
+- Fix: express the contour with `border-radius` (`GlassSurface` writes it from `shape.cornerRadii`),
+  and use `mask-image` for irregular outlines — a mask does not take that fallback.
 
 ### Nested glass belongs in a sibling layer of the surface
 

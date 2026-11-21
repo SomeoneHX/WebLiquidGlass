@@ -69,6 +69,13 @@
  * parse the declaration and then paint nothing for it, which is why the host writes the plain
  * blur on its own for non-Chromium engines instead of appending `url()` to it.
  *
+ * The host element must not be clipped by `clip-path`: a clipped element carrying an SVG
+ * backdrop filter is composited on the CPU (measured 8.3 fps against 63 fps for the same filter
+ * graph on the same page), and the map is built from `border-radius`, so the bend would not
+ * follow that clip either. Shapes come from `border-radius`; `readCornerRadii` is the only
+ * geometry the host asks for. Irregular outlines belong in `mask-image`, which does not force
+ * the CPU path.
+ *
  * ## Gates measured on a plain page (headless Chromium, control = `scale 0` vs `scale 60`)
  *
  * - Refraction reaches the screen. Two screenshots differing only in `refractionAmount` differ
@@ -1486,6 +1493,28 @@ function readCornerRadii(el) {
   })
 }
 
+/** Warned once per page — the first clipped surface names the reason. */
+let warnedClipPath = false
+
+/**
+ * A `clip-path` on the element and the SVG backdrop filter on the same element cannot be
+ * composited on the GPU: the surface falls back to CPU rasterisation (measured 8.3 fps against
+ * 63 fps for the same filter graph). The map is built from `border-radius` either way, so the
+ * bend would not follow the clip.
+ */
+function warnIfClipped(el) {
+  if (warnedClipPath) return
+  const clip = getComputedStyle(el).clipPath
+  if (!clip || clip === 'none') return
+  warnedClipPath = true
+  console.warn(
+    `[liquid-glass] ${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''} is clipped by ` +
+      '`clip-path`, so this surface is rasterized on the CPU (measured 8.3 fps against 63 fps ' +
+      'for the same filter graph) and the refraction follows its border-radius rather than the ' +
+      'clip. Use border-radius for the shape.'
+  )
+}
+
 function buildBackdropValue(opts) {
   const base = []
   if (opts.blur > 0) base.push(`blur(${opts.blur}px)`)
@@ -1545,6 +1574,8 @@ function glassify(el, options) {
       if (!ok) degradeAll()
     })
   }
+
+  warnIfClipped(el)
 
   const existing = hosts.get(el)
   if (existing) {

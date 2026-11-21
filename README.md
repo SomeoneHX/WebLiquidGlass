@@ -235,7 +235,7 @@ npm run probe:fidelity    # 13 个目的地的渲染指纹，用于改动前后 
 - 部分高频滤镜图有 96 张上限的 LRU 缓存（`mapCache`）。
 - 站点若用 CSP 限制 `img-src`（不允许 `data:`），`<feImage>` 的位移图会被拒绝且**完全静默**——详见 [§10](#10-用户脚本liquid-glass-refraction)。
 - 无头环境（`--dump-dom`）会饿死 `rAF`，弹簧动画只出极少帧——验证动画是否在跑应读 inline transform 是否随时间变化，而非看截图。
-- **大面积玻璃仍然昂贵，且代价集中在一处**：每个玻璃表面都要为 `backdrop-filter` 维护一份独立的滤镜图（SDF → 位移图 → `feImage` + `feDisplacementMap`），其中**只有那条 `url(#…)` 位移图在花帧时间**——去掉它，一屏 20 个面就从 8.5 fps 回到 63 fps（与全部隐藏玻璃层同速）。所以约束是**同屏折射面的数量与面积**，不是 JS 或布局；实测、口径与已清掉的浪费见 [§11](#11-性能)。
+- **帧时间不再由玻璃决定**：一屏 20 个整宽折射面的滚动稳定在 63 fps，与把玻璃层全部隐藏同速（[§11](#11-性能)）。代价挪到了形状表达上——玻璃面若同时带 `clip-path` 与 `backdrop-filter: url(#…)`，这个面会退回 CPU 光栅化，同一张图、同样的像素掉到 8.3 fps；轮廓必须用 `border-radius`。
 - `colorControls` 的 `brightness` 在原版是**加法**（进颜色矩阵的常数项 `t = (0.5 − 0.5c + brightness)·255`），而 CSS 的 `brightness()` 是**乘法**；CSS `contrast(0.75)` 自带的常数 31.875 比原版的 6.375 大 25.5，中灰偏亮约 6%。时钟板已改为在滤镜里用 `feColorMatrix` 精确实现（见 §9），**其余页面仍是 CSS 版**。
 - 后续可探索：把 `glass-filter` 的位移图生成移到 Worker、对非 Chromium 增加 WebGL 折射 fallback（若届时允许引入 WebGL）。
 
@@ -356,7 +356,7 @@ window.LiquidGlassRefractConfig = {
 ### 10.5 使用前须知
 
 - **必须自己给 tint**：脚本不改元素自身样式，元素需要有半透明背景（如 `background: rgba(255,255,255,.16)`），否则只有透镜没有磨砂色；
-- **形状即 `border-radius`**：圆角从 computed style 读取，想要胶囊就写 `border-radius: 50%` 或大圆角，位移图按同一几何生成；
+- **形状即 `border-radius`**：圆角从 computed style 读取，想要胶囊就写 `border-radius: 50%` 或大圆角，位移图按同一几何生成；**不要用 `clip-path` 裁这个元素**——它和 `url()` 一起会把该面推回 CPU 光栅化（63.3 → 8.3 fps），而且位移图仍按 `border-radius` 生成，弯折也跟不上那道裁剪；
 - **仅 Chromium**：Safari / Firefox 会把带 `url()` 的整条声明丢掉，脚本对这类引擎只写纯模糊；
 - **CSP 是硬门槛**：页面若限制 `img-src` 不允许 `data:`，位移图会被拒且不报错（每个 `<feImage>` 触发一次 `securitypolicyviolation`，但控制台不会有任何报错），脚本用 1×1 PNG 探针检出后整体降级为纯磨砂并 `console.warn` 原因。**被拒时最终上屏结果与纯 `blur()` 控制组逐像素相同**（实测 0 px / 57600），所以损失的是"透镜"本身与那份被浪费的 SDF/PNG 计算，而不是画面画错；哪些站点会命中见 [§10.8](#108-实测真实站点的-csp-分布)；
 - **祖先元素会截断 backdrop**：任何带 `filter` / `opacity < 1` / `mask` 的祖先都会成为 backdrop root，玻璃只能采到它内部的内容；
@@ -554,16 +554,16 @@ npm run probe:perf
 
 测试机：**Intel Xeon E3-1230 v2（8 线程）+ AMD Radeon RX 570**，macOS 15.7.5 上的 headless Chromium（ANGLE Metal，与 `probe:render` 打印的 rasteriser 同一台）。
 
-| 状态 | fps（3 遍） | 滚完耗时 | 主线程占用 | 过滤器属性写入 | 画布操作 |
-| --- | --- | --- | --- | --- | --- |
-| 现状 | **8.5**（6.9–9.2） | 3531 ms | 2.9% | **0** | 154 |
-| 去掉 `url(#…)`，只留 `blur/saturate/brightness` | **63**（62–63.1） | 476 ms | 17.1% | 0 | 154 |
-| 隐藏全部玻璃层 | **63**（62.9–63.7） | 476 ms | 13.3% | 0 | 154 |
+现状：**63.3 fps**（3 遍 63.1–63.5），滚完 474 ms，主线程占用 17.7%，过滤器属性写入 0，画布操作 154。去掉 `url(#…)` 只留 `blur/saturate/brightness`、或把玻璃层全部隐藏，都不会更快——三档同速，这一页的帧预算不再由玻璃决定。探针从此只作回归用：若哪个改动把玻璃面推回 CPU 光栅化，这一行会掉回 8 fps 量级。
 
-两个能直接读出来的结论：
+挡帧率的不是面的数量与面积，而是**形状怎么表达**。同一个面、同一张滤镜图、同样的像素：
 
-1. **全部帧代价就是那条 SVG 位移图。** 去掉 `url(#…)` 就与"把玻璃层全隐藏"完全同速（63 = 63，滚完耗时同为 476 ms）——纯 `blur() saturate() brightness()` 在这个尺寸与数量下**基本免费**。
-2. **低 fps 配低主线程占用 = 瓶颈在光栅化，不在 JS。** 现状一档只占 2.9% 主线程却只有 8.5 fps；反倒是 63 fps 的两档"主线程占用"更高（十几 %），因为墙钟时间短、同一段 JS 被摊到更小的分母上。任何"是不是 JS 太慢"的猜测，看这两列就能否掉。
+| 形状写法 | fps |
+| --- | --- |
+| `border-radius` | 63.3 |
+| `clip-path: path(…)` | 8.3 |
+
+`clip-path` 是非矩形裁剪，合成器无法把它当成带滤镜的 quad 来合成，整个面退回 raster 阶段的 CPU 图像滤镜：每帧每个面全量软件光栅化。这件事与 GPU 在不在场无关——带 `clip-path` 时关掉 GPU 只从 8.3 掉到 5.4，而两档本来就都在 CPU 上；去掉它之后 63.3 对 13.4，差的 4.7 倍才是 GPU 着色器的差价。所以玻璃面的轮廓一律用 `border-radius` 表达（`GlassSurface` 写 `shape.cornerRadii`），字形这类不规则轮廓走 `mask-image`，不受影响。
 
 （§10.10 / §10.11 讲折射**看起来**是什么，这里讲它**花多少**——共用同一套探针。）
 
@@ -573,26 +573,20 @@ npm run probe:perf
 
 | 位置 | 做法 |
 | --- | --- |
-| `glassFilter.update()` | 按节点记住上次的 `feDisplacementMap[scale]`，同值不写——滚动时该值每帧完全相同（上表 `fe 写入 = 0`）。写过滤器图元属性会让过滤器失效 |
+| `glassFilter.update()` | 按节点记住上次的 `feDisplacementMap[scale]`，同值不写——滚动时该值每帧完全相同（`fe 写入 = 0`）。写过滤器图元属性会让过滤器失效 |
 | `buildMap` | 只扫描边界允许的行列，中性灰一次 `Uint32Array.fill` 写入；12 种几何的全扫描对照见 §10.12 |
 | `MAP_LIMIT` | 96（一次带色散的按压就要 42 个条目，32 会把自己淘汰掉） |
 | `isRefractionSupported()` | 记忆化 |
-| `GlassSurface` 的样式写入 | transform / clip-path / 遮罩梯度 / `backdrop-filter` 同值跳过 |
-| 三层装饰画布 | 绘制签名不变则跳过（上表 `画布操作 = 154` / 30 帧） |
+| `GlassSurface` 的样式写入 | transform / border-radius / 遮罩梯度 / `backdrop-filter` 同值跳过 |
+| 三层装饰画布 | 绘制签名不变则跳过（`画布操作 = 154` / 30 帧） |
 
 **按压的另一处代价**（同一命令的第二个场景）：`Toggle` 按住 1.5 s 会重建 15–18 张位移图，其中 **63–80 ms 花在 `canvas.toDataURL`**——主线程上的同步 PNG 编码。它分散在按压动画的十几帧里，所以帧率看不出问题（§10.12 的 `fidelity` 也不受影响），但它确实是这块屏按下时唯一接近"卡一下"的地方。要再降只有两条路，都属取舍：把编码挪出帧（`OffscreenCanvas.convertToBlob` + `URL.createObjectURL` 异步回写 `href`，但 `blob:` 的 CSP 接受面比 `data:` 窄，会影响用户脚本在部分站点的可用性），或按 `refractionHeight` 预生成阶梯。
-
-### 11.2 没有解决的部分
-
-`url(#…)` 的位移图每帧要被浏览器重新光栅化，**这个量级动不了**：8.5 fps 是现状，63 fps 是"不要折射"的价格。于是同屏折射面的数量与面积就是硬预算。`FILTER_PAD`（全局 64）让过滤器区域比元素本身大一圈——1408×160 的行实际按 1536×288 光栅化——按面收缩能再换回一点，但不改变量级。
-
-要在这个载体上继续追，方向只能是"少光栅化"（减少同屏折射面、或缩小其面积），而不是"写得更快的 JS"。另一条常被想到的路——放弃 `backdrop-filter`、由应用自绘背景——能把这个量级拿回来，但它要求应用知道背景是什么，而 `backdrop` 的全部意义正是折射**真实位于其后**的内容（§3.3），不是应用自己的壁纸（它也迁移不到用户脚本面对任意站点的场景）。
 
 ---
 
 ## ⚠️ 注意事项（宿主页面的约束）
 
-以下几条不是本库的实现缺陷，而是 `backdrop-filter` 与 `mix-blend-mode` 在浏览器里的固有约束。宿主页面若不符合这些条件，玻璃会"看着还在、其实已经不折射了"——排查时请先核对这几条。
+以下几条不是本库的实现缺陷，而是 `backdrop-filter` 与 `mix-blend-mode` 在浏览器里的固有约束。宿主页面若不符合这些条件，玻璃会"看着还在、其实已经不折射了"，或者画面正确但整层退回 CPU 光栅化（只有慢，没有错）——排查时请先核对这几条。
 
 ### 玻璃面不能放在 `position: fixed` 的容器里
 
@@ -606,6 +600,13 @@ npm run probe:perf
 ### 玻璃的祖先不能带圆角裁切
 
 `overflow: hidden`（或 `clip`）**加上**非零 `border-radius` 的祖先，会让 Chromium 跳过 `backdrop-filter` 的 SVG 滤镜那条路，`lens` 采不到任何背景。直角裁切不受影响：只把圆角置 0、保留裁切即可恢复。
+
+### 玻璃面自身不能用 `clip-path` 裁剪
+
+`clip-path` 配上 `backdrop-filter: url(…)`，这个面就不再作为"带滤镜的 quad"合成，整块退回 raster 阶段的 CPU 图像滤镜：每帧每个面全量软件光栅化。同一张滤镜图、同样的像素，`border-radius` 63.3 fps、`clip-path: path(…)` 8.3 fps（[§11](#11-性能)）。
+
+- 表现：画面完全正确，只是慢；面数少时几乎看不出来。
+- 做法：轮廓用 `border-radius`（`GlassSurface` 从 `shape.cornerRadii` 写），需要不规则轮廓用 `mask-image` —— 遮罩不走这条回退。
 
 ### 嵌套玻璃要放在玻璃面的兄弟层
 

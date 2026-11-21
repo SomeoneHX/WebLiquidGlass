@@ -323,18 +323,12 @@ function setStyle(el: HTMLElement, property: string, value: string): void {
   else el.style.removeProperty(property)
 }
 
-/** `Shape.clipPath` builds a path string; the result only depends on the shape and the box. */
-let clipShape: Shape | null = null
-let clipKey = ''
-let clipValue = ''
-function clipPathFor(shape: Shape, width: number, height: number): string {
-  const key = `${width}x${height}`
-  if (clipShape !== shape || clipKey !== key) {
-    clipShape = shape
-    clipKey = key
-    clipValue = shape.clipPath(width, height)
-  }
-  return clipValue
+/** `Shape.cornerRadii` as a `border-radius` value, in the same `tl tr br bl` order. */
+function cornerRadiusCss(shape: Shape, width: number, height: number): string {
+  return shape
+    .cornerRadii(width, height)
+    .map((r) => `${r}px`)
+    .join(' ')
 }
 
 /**
@@ -378,7 +372,11 @@ function applyLensStyle(): void {
   const height = size.value.height
   if (!el || width <= 0 || height <= 0) return
 
-  setStyle(el, 'clip-path', clipPathFor(props.shape, width, height))
+  // `backdrop-filter` paints the whole border box; the corner radii are what cut that rectangle
+  // into the shape. `border-radius` rather than `clip-path: path()` because a non-rectangular
+  // clip and an SVG backdrop filter on the same element do not composite on the GPU — the plate
+  // is then rasterized on the CPU every frame it moves (README §11).
+  setStyle(el, 'border-radius', cornerRadiusCss(props.shape, width, height))
 
   if (!props.backdrop.samples) {
     setStyle(el, 'backdrop-filter', '')
