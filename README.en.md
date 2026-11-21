@@ -584,9 +584,10 @@ it, 63.3 against 13.4 is what the GPU shader is worth. So the contour of a glass
 `border-radius` (`GlassSurface` writes `shape.cornerRadii`); irregular outlines belong in
 `mask-image`, which does not trigger the fallback.
 
-Area only sets how much work each of those passes does. Cross-check: a page with 31 surfaces and 5.1 M
-device pixels in total runs at 29 fps, while this one runs at 63 fps with 20 surfaces and 35 M — the
-difference is the count, not the area.
+Area only sets how much work each of those passes does — and **an off-screen surface is never drawn**.
+Cross-check on the same 31-surface page: 8 visible lenses run at 29 fps, 3 visible at 60 fps, while
+going from 16 to 31 surfaces with the visible count unchanged moves nothing (29.9 / 30.4). The budget
+is the number of lenses **on screen**, not the total, and not the area.
 
 (§10.10 / §10.11 describe what the refraction **looks like**; this section describes what it **costs**.
 Same probe.)
