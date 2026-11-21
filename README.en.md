@@ -567,8 +567,9 @@ hiding every glass layer, is not any faster — the three states now run at the 
 frame budget on this page is no longer set by the glass. The probe is a regression instrument from
 here on: anything that pushes a surface back onto CPU rasterisation drops that row to the 8 fps range.
 
-What sets the frame rate is not the number or area of surfaces but **how the shape is expressed**.
-Same surface, same filter graph, same pixels:
+What sets the frame rate is **how the shape is expressed** first, and **how many surfaces there are** second:
+every surface pays its own backdrop snapshot and its own compositing pass, every frame. Same surface, same
+filter graph, same pixels:
 
 | shape | fps |
 | --- | --- |
@@ -582,6 +583,10 @@ clip in place, disabling the GPU only moves 8.3 to 5.4 because both were already
 it, 63.3 against 13.4 is what the GPU shader is worth. So the contour of a glass surface is always
 `border-radius` (`GlassSurface` writes `shape.cornerRadii`); irregular outlines belong in
 `mask-image`, which does not trigger the fallback.
+
+Area only sets how much work each of those passes does. Cross-check: a page with 31 surfaces and 5.1 M
+device pixels in total runs at 29 fps, while this one runs at 63 fps with 20 surfaces and 35 M — the
+difference is the count, not the area.
 
 (§10.10 / §10.11 describe what the refraction **looks like**; this section describes what it **costs**.
 Same probe.)
